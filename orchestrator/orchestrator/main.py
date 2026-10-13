@@ -43,6 +43,23 @@ An incident the Approver escalates (not whitelisted, below
 call is a cheap no-op for that incident (all its existing stages are already
 present, so no stage is recomputed or re-appended) until a human resolves it
 out of band.
+
+Consequence for repeated-trial evaluation (read this before building Task
+17's chaos harness): `db.get_open_incident(scenario, target)` treats an
+incident as "open" until it has a `verification` row, so an escalated
+incident — which never gets one — stays "open" for that exact
+`(scenario, target)` pair forever. `observer.poll_once`'s dedup check skips
+opening a new incident whenever one is already open for that pair. So the
+moment a single incident for, say, `(pod_crash, cartservice)` escalates,
+every *subsequent* `pod_crash` breach on `cartservice` is silently ignored —
+no new `anomaly_detected` row, no diagnosis, nothing — until a human
+resolves the stuck incident out of band (there is currently no in-repo
+mechanism to do this; none is built as part of this task). A harness that
+runs N repeated trials of the same scenario against the same target (e.g.
+Task 17's planned 10 repeats per scenario) must check for this between
+runs and clear/resolve any escalated incident first, or every run after the
+first escalation will silently appear as "not detected" rather than
+reflecting the actual fix/verify outcome.
 """
 
 from __future__ import annotations
@@ -77,10 +94,23 @@ SCENARIOS: list[tuple[str, str]] = [
     ("memory_pressure", "productcatalogservice"),
 ]
 
-# `build_evidence`'s lookback window, matching `observer.poll_once`'s own
-# hardcoded value (see observer.py) so the Verifier re-checks the same
-# window of signal the Observer originally alarmed on.
-EVIDENCE_WINDOW_SECONDS = 300
+# `build_evidence`'s lookback window used by the verification lambda in
+# `_advance_incident`. This is intentionally NOT the same 300s window
+# `observer.poll_once` uses for original detection (see observer.py, which
+# hardcodes its own 300s independently). Verification runs only ~one poll
+# interval plus VERIFY_BACKOFF_SECONDS after the fix was applied (tens of
+# seconds), but a 300s window would still contain the pre-fix breach
+# signal: for pod_crash, `increase(...restarts_total[300s])` would still
+# see the restarts that happened before the fix; for memory_pressure,
+# pre-fix OOMKilled log lines would still be inside a 300s-equivalent
+# lookback. A verification row permanently resolves (or fails to resolve)
+# the incident — there's no retry — so a stale window would read the old
+# breach and wrongly report `recovered=False` forever, silently corrupting
+# every chaos run's measured recovery outcome (Task 17's harness depends
+# on this being accurate). This window is sized to roughly "time since the
+# fix was applied" instead: long enough for a stable reading, short enough
+# to exclude the pre-fix breach.
+VERIFY_WINDOW_SECONDS = 60
 
 # Default verifier backoff per the plan's Global Constraints ("Verifier
 # backoff: fixed 30s wait before re-checking (env-overridable
@@ -221,7 +251,7 @@ def _advance_incident(
         result = verifier.verify(
             scenario,
             lambda: observer.build_evidence(
-                prom_client, loki_client, scenario, target, EVIDENCE_WINDOW_SECONDS
+                prom_client, loki_client, scenario, target, VERIFY_WINDOW_SECONDS
             ),
             observer.check_threshold,
             backoff_seconds=_verify_backoff_seconds(),
@@ -247,10 +277,21 @@ def run_once(
 ) -> None:
     """Run one full poll cycle: detect new anomalies, then advance every
     incomplete incident's pipeline state, driven entirely by Postgres.
+
+    Each incident's `_advance_incident` call is wrapped in its own
+    try/except so that one incident raising (a non-`ApiException` Fixer
+    error, a Prometheus/Loki HTTP error from `build_evidence`, a `KeyError`
+    from a malformed persisted payload, a DB error, ...) is logged and
+    skipped rather than propagating out of `run_once` — otherwise one bad
+    incident would abort the whole poll cycle and every *other* incident
+    due for advancement in this cycle would silently miss its turn.
     """
     observer.poll_once(prom_client, loki_client, conn, scenarios)
     for incident_id in db.get_incomplete_incidents(conn):
-        _advance_incident(conn, prom_client, loki_client, core_v1, apps_v1, incident_id, confidence_threshold)
+        try:
+            _advance_incident(conn, prom_client, loki_client, core_v1, apps_v1, incident_id, confidence_threshold)
+        except Exception:
+            logger.exception("failed to advance incident %s; will retry next poll cycle", incident_id)
 
 
 class PrometheusClient:
@@ -318,7 +359,14 @@ def main() -> None:
         cfg.confidence_threshold,
     )
     while True:
-        run_once(conn, prom_client, loki_client, core_v1, apps_v1, SCENARIOS, cfg.confidence_threshold)
+        try:
+            run_once(conn, prom_client, loki_client, core_v1, apps_v1, SCENARIOS, cfg.confidence_threshold)
+        except Exception:
+            # One bad poll cycle (e.g. a transient Postgres/K8s/Prometheus
+            # outage not already caught inside run_once) must not crash the
+            # process and crash-loop the pod; log it and try again next
+            # interval.
+            logger.exception("poll cycle failed; will retry after the usual interval")
         logger.info("poll cycle complete, sleeping %ss", cfg.poll_interval_seconds)
         time.sleep(cfg.poll_interval_seconds)
 

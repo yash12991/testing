@@ -31,11 +31,18 @@ class FakePromClient:
     With `breach_then_healthy_sequence=True`: the first `build_evidence`
     call (5 `.query()` calls, in the fixed order `build_evidence` issues
     them) reports a pod_crash breach (restart_count_delta > 0); every
-    `build_evidence` call after that reports a fully healthy pod (used by
-    `main.run_once`'s diagnosis step is read from the stored
-    anomaly_detected payload rather than re-querying, so in practice only
-    the Observer's initial poll and the Verifier's post-fix check ever call
-    `build_evidence` for this test).
+    `build_evidence` call after that reports a fully healthy pod.
+    `main.run_once`'s diagnosis step reads from the stored anomaly_detected
+    payload rather than re-querying, so `build_evidence` is never called by
+    diagnosis/approval/fixer. It IS called by `observer.poll_once`'s own
+    detection query — but only while there is no open incident yet for that
+    (scenario, target) pair, since `poll_once`'s dedup check skips the
+    pair entirely once an incident is open — and by the Verifier's post-fix
+    recovery check once `fix_executed` already exists. So across a test
+    with several `run_once` calls, `build_evidence` fires: once for the
+    call that first detects the breach, once for the call that verifies
+    the fix, and once more for any later call made after the incident
+    resolves and `poll_once` resumes polling that pair for a fresh anomaly.
     """
 
     QUERIES_PER_BUILD = 5
@@ -89,22 +96,43 @@ def test_run_once_drives_one_incident_from_anomaly_to_verified_recovery(db_conn)
     )
     incident_id = db.get_open_incident(db_conn, "pod_crash", "cartservice")
     assert incident_id is not None  # anomaly created, not yet resolved
-
-    main.run_once(
-        db_conn, fake_prom, FakeLokiClient(), core_v1, apps_v1,
-        scenarios=[("pod_crash", "cartservice")], confidence_threshold=0.8,
-    )
-    # second pass: diagnosis + approval + fix_executed should now exist
+    # First call: `observer.poll_once` writes `anomaly_detected`, and
+    # `_advance_incident` cascades all the way through diagnosis, approval,
+    # and fix_executed within this SAME call (see main.py's module
+    # docstring for why eager cascading is correct). Verification is
+    # deliberately NOT attempted here — `fix_executed` was not already
+    # present *before* this call began, which is exactly the condition
+    # `_advance_incident` uses to hold verification back a call.
     stages = [e.stage for e in db.get_events(db_conn, incident_id)]
-    assert "fix_executed" in stages
+    assert stages == ["anomaly_detected", "diagnosis", "approval", "fix_executed"]
 
     main.run_once(
         db_conn, fake_prom, FakeLokiClient(), core_v1, apps_v1,
         scenarios=[("pod_crash", "cartservice")], confidence_threshold=0.8,
     )
+    # Second call: `fix_executed` was already present before this call's
+    # own processing began, so verification now runs and (since the fake
+    # Prometheus client reports healthy after its first 5 queries) reports
+    # `recovered=True`, resolving the incident. Pinning the exact stage
+    # list here (not just "verification in stages") proves verification
+    # is never run in the same call that wrote fix_executed.
     stages = [e.stage for e in db.get_events(db_conn, incident_id)]
     assert stages == ["anomaly_detected", "diagnosis", "approval", "fix_executed", "verification"]
     assert db.get_open_incident(db_conn, "pod_crash", "cartservice") is None
+
+    main.run_once(
+        db_conn, fake_prom, FakeLokiClient(), core_v1, apps_v1,
+        scenarios=[("pod_crash", "cartservice")], confidence_threshold=0.8,
+    )
+    # Third call: the incident is now resolved (has a `verification` row),
+    # so `observer.poll_once`'s dedup check no longer skips this
+    # (scenario, target) pair and it calls `build_evidence` again looking
+    # for a fresh anomaly. The fake reports healthy by now, so no new
+    # incident is created and this incident's stages are unchanged — this
+    # is the "third call's poll_once also calls build_evidence" case
+    # `FakePromClient`'s docstring calls out.
+    stages = [e.stage for e in db.get_events(db_conn, incident_id)]
+    assert stages == ["anomaly_detected", "diagnosis", "approval", "fix_executed", "verification"]
 
     # The pod really was deleted via the K8s mock, confirming the Fixer stage
     # actually ran against core_v1 rather than being skipped/faked.
