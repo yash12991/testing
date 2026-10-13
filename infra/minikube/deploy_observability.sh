@@ -28,10 +28,12 @@
 #
 # First-time installs pull several images (prometheus-operator,
 # kube-state-metrics, node-exporter, prometheus itself, loki, promtail) and
-# can take a few minutes on a host with no local image cache yet. This
-# script waits for Helm's own --wait, but the caller should still expect
-# `kubectl get pods -n monitoring` to show pods in `Running` only after
-# that image pull completes.
+# can take a few minutes on a host with no local image cache yet. Both
+# `helm upgrade --install` calls below pass `--wait` (plus `--timeout 10m`),
+# so each one blocks until its release's pods/deployments report Ready
+# before the script moves on. That means the final `kubectl get pods -n
+# monitoring` in main() reflects pods that have already reached
+# Running/Ready, not just pods that were freshly submitted.
 #
 set -euo pipefail
 
@@ -57,6 +59,7 @@ install_prometheus() {
   helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
     --namespace "${NAMESPACE}" \
     --values "${PROMETHEUS_VALUES}" \
+    --wait \
     --timeout 10m
 }
 
@@ -65,6 +68,7 @@ install_loki() {
   helm upgrade --install loki grafana/loki-stack \
     --namespace "${NAMESPACE}" \
     --values "${LOKI_VALUES}" \
+    --wait \
     --timeout 10m
 }
 
