@@ -1,0 +1,115 @@
+# chaos-mesh-values.yaml
+#
+# Override values for the chaos-mesh/chaos-mesh Helm chart (v2.8.4),
+# installed into the `chaos-mesh` namespace of the Minikube cluster used
+# for the chaos-engineering / auto-remediation pipeline.
+#
+# This cluster is a single Minikube node also running Online Boutique (12
+# services, `online-boutique` namespace) and the Prometheus + Loki
+# observability stack (`monitoring` namespace, see task-3's
+# prometheus-values.yaml / loki-values.yaml). Resources/replicas below are
+# trimmed accordingly, and unneeded Chaos Mesh components (dashboard UI,
+# DNSChaos's CoreDNS server, chaos-mesh's own bundled Prometheus) are
+# disabled rather than left at chart defaults.
+#
+# -----------------------------------------------------------------------
+# chaosDaemon.runtime / socketPath
+# -----------------------------------------------------------------------
+# The chart defaults to `runtime: docker` / socketPath
+# /var/run/docker.sock, which is WRONG for this cluster: the host runs
+# Minikube rootless on Podman, but the in-cluster container runtime (the
+# CRI the kubelet/node actually use) is containerd, not Docker. Verified
+# directly against the running node:
+#   kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}'
+#     -> containerd://2.3.4
+# and by mounting the host's /run into a scratch pod and confirming
+# /run/containerd/containerd.sock exists there. chaos-daemon needs to talk
+# to the REAL in-cluster CRI socket to inject faults (pause/kill
+# containers, stress CPU/memory via cgroups), so runtime/socketPath must
+# match containerd, not whatever happens to be on the host outside the
+# cluster.
+#
+# -----------------------------------------------------------------------
+# clusterScoped / controllerManager.targetNamespace
+# -----------------------------------------------------------------------
+# The task brief asks to "restrict the webhook's namespace selector to
+# allow online-boutique". That phrase does not correspond to any actual
+# field in this chart version: the `webhook:` block below only configures
+# the MutatingWebhookConfiguration/ValidatingWebhookConfiguration that
+# validates Chaos Mesh's OWN custom resources (PodChaos, StressChaos, ...)
+# when they're created, and has no namespaceSelector anywhere in the
+# chart's templates.
+#
+# The closest real mechanism is `clusterScoped: false` +
+# `controllerManager.targetNamespace: online-boutique`, which switches the
+# controller-manager/dashboard/dns-server RBAC from ClusterRole to a
+# namespace-scoped Role/RoleBinding. This was tried and tested directly
+# against the live cluster, and it is BROKEN in chart 2.8.4: with
+# clusterScoped: false, the unconditional "remotecluster" controller
+# (enabled by the default `enabledControllers: ["*"]`, part of multi-cluster
+# federation support that this project does not use) still tries to
+# list/watch the cluster-scoped `remoteclusters.chaos-mesh.org` CRD, which a
+# namespace-scoped RoleBinding can never grant (cluster-scoped resources
+# require a ClusterRoleBinding to be listable at all). That reflector fails
+# every ~30s with "forbidden ... at the cluster scope", which blocks the
+# controller-runtime manager's initial cache sync forever — so NONE of the
+# other controllers (including podchaos-pipeline / stresschaos-pipeline)
+# ever start reconciling. Verified concretely: applied a PodChaos
+# (pod-kill, targeting online-boutique/currencyservice) under
+# clusterScoped: false and it sat with empty `status.experiment` and no
+# reconcile log line, ever — i.e. Chaos Mesh's core PodChaos/StressChaos
+# function (this task's required interface) did not work under that
+# configuration.
+#
+# Given the brief's literal "webhook namespace selector" doesn't exist and
+# its real equivalent breaks the chart in this version, this values file
+# keeps `clusterScoped` at its chart default (true, cluster-wide RBAC) so
+# PodChaos/StressChaos actually reconcile. Chaos Mesh is still only ever
+# told to target `online-boutique` because every Chaos CR this project
+# creates sets `spec.selector.namespaces: [online-boutique]` — enforced at
+# the CR-authoring level (future tasks' PodChaos/StressChaos manifests),
+# not at the Helm/RBAC level. This is a deliberate, documented deviation
+# from the brief's Step 1 wording, verified against the real chart rather
+# than assumed.
+
+controllerManager:
+  # No HA needed on a single-node Minikube cluster already running Online
+  # Boutique + Prometheus + Loki; chart default is 3.
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+chaosDaemon:
+  runtime: containerd
+  socketPath: /run/containerd/containerd.sock
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+# Chaos Dashboard UI is not needed for this task's interface (controller
+# able to apply PodChaos/StressChaos CRDs is sufficient; no human-facing
+# dashboard is part of the required surface). Disabling it removes one
+# Deployment + Service + PVC worth of resources.
+dashboard:
+  create: false
+
+# DNSChaos's CoreDNS-based chaos-dns-server is not needed for
+# PodChaos/StressChaos; disabling it removes one Deployment + Service.
+dnsServer:
+  create: false
+
+# chaos-mesh's own bundled Prometheus (for its internal component metrics)
+# is redundant with the dedicated kube-prometheus-stack already installed
+# in `monitoring` (task 3). Chart default is already false; kept explicit
+# for clarity.
+prometheus:
+  create: false
