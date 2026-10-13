@@ -75,6 +75,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -95,6 +96,47 @@ from orchestrator import db  # noqa: E402
 from harness import report  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+class TerminationRequested(SystemExit):
+    """Raised by `_handle_termination_signal` instead of letting the
+    process die outright.
+
+    Python's default SIGTERM disposition terminates the interpreter
+    immediately, WITHOUT running any `try/finally` block that happens to
+    be on the stack — including `run_trial`'s `finally: _delete_manifest
+    (...)`, whose entire job is to remove the chaos manifest it just
+    applied. That is almost certainly how the `cpu-stress-
+    recommendationservice` StressChaos resource got orphaned earlier,
+    when a background harness process running this script was
+    interrupted mid-trial (task-17-report.md section 4). Raising a
+    `SystemExit` subclass instead means the interpreter unwinds the stack
+    like any other exception — every `finally` block (and the `conn.close
+    ()` in `main`'s `finally`) still runs — and `SystemExit` still exits
+    the process once unwound, so `kubectl delete` for the in-flight trial
+    actually happens before the process goes away.
+    """
+
+
+def _handle_termination_signal(signum: int, frame: Any) -> None:
+    signal_name = signal.Signals(signum).name
+    logger.warning(
+        "received %s; finishing the current trial's cleanup before exiting", signal_name
+    )
+    raise TerminationRequested(f"terminated by {signal_name}")
+
+
+def install_termination_handlers() -> None:
+    """Install handlers for SIGTERM (e.g. a backgrounded process being
+    killed) and SIGINT (Ctrl+C) so in-flight `finally` cleanup — notably
+    `kubectl delete` of the current trial's chaos manifest — still runs
+    on external termination. Python's own default SIGINT disposition
+    already raises `KeyboardInterrupt` (which also unwinds `finally`
+    blocks), but SIGTERM's default disposition does not; both are handled
+    identically here for a single, well-documented termination path.
+    """
+    signal.signal(signal.SIGTERM, _handle_termination_signal)
+    signal.signal(signal.SIGINT, _handle_termination_signal)
 
 NAMESPACE = "online-boutique"
 CHAOS_DIR = _REPO_ROOT / "infra" / "manifests" / "chaos-experiments"
@@ -355,6 +397,8 @@ def write_report(
 
 
 def main() -> None:
+    install_termination_handlers()
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs-per-scenario", type=int, default=10)
     parser.add_argument(

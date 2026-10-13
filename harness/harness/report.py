@@ -47,6 +47,24 @@ implementer (the brief's own worked examples only pin `runs`,
   it actually recovered (`remediation_success` separately tracks the
   recovered=True count) — this reports "how long until the pipeline reached
   a resolution attempt," a meaningful number even on a failed attempt.
+  EXCEPTION: an incident any of whose `verification` rows has
+  `manually_closed_by_harness: True` (see `run_experiments.py`'s module
+  docstring — the harness synthesizes this row when an incident escalates
+  or times out, purely so its own dedup-blocking workaround doesn't wedge
+  future repeats) is excluded from `mttr_s` entirely and never counted
+  toward `remediation_success`, regardless of that row's `recovered`
+  value. That "verification" timestamp reflects how long the *harness*
+  took to poll and give up, or the harness's own resolution-timeout
+  constant — not a real repair time — so folding it into "mean MTTR" would
+  silently contaminate the metric with values that have nothing to do with
+  the pipeline's actual performance. This check looks at *every*
+  `verification` row for the incident, not just the last one by `id`: if
+  the harness's synthetic failure row is later followed by a genuine
+  orchestrator `verification` row (e.g. a race where the real pipeline
+  finishes resolving an incident the harness had already given up on and
+  closed), the incident must still count as harness-closed — a late real
+  row must not silently flip a timed-out/escalated incident into a
+  success.
 
 - "escalation": an incident whose `approval` stage has `approved: False`.
   Per `orchestrator.approver.approve`, an escalated incident never gets a
@@ -121,6 +139,16 @@ def aggregate_results(rows: list[EventRowLike]) -> dict[str, ScenarioStats]:
         approval = by_stage.get("approval")
         verification = by_stage.get("verification")
 
+        # Look at EVERY verification row for this incident (not just the
+        # last one `by_stage` kept) so a genuine orchestrator verification
+        # that happens to arrive after the harness's synthetic
+        # escalated/timed-out close can't silently override it — see this
+        # module's docstring.
+        verification_harness_closed = any(
+            row.stage == "verification" and row.payload.get("manually_closed_by_harness")
+            for row in incident_rows
+        )
+
         if anomaly is not None and diagnosis is not None:
             s.detection_times_s.append((diagnosis.ts - anomaly.ts).total_seconds())
 
@@ -132,7 +160,7 @@ def aggregate_results(rows: list[EventRowLike]) -> dict[str, ScenarioStats]:
         if approval is not None and approval.payload.get("approved") is False:
             s.escalations += 1
 
-        if anomaly is not None and verification is not None:
+        if anomaly is not None and verification is not None and not verification_harness_closed:
             s.mttr_s.append((verification.ts - anomaly.ts).total_seconds())
             if verification.payload.get("recovered") is True:
                 s.remediation_success += 1

@@ -96,6 +96,68 @@ def test_aggregate_results_empty_input_returns_empty_dict():
     assert report.aggregate_results([]) == {}
 
 
+def test_aggregate_results_excludes_harness_closed_verification_from_mttr():
+    """A `verification` row the harness synthesized after an escalation or
+    resolution timeout (`manually_closed_by_harness: True`, see
+    `run_experiments.py`'s module docstring) must not feed `mttr_s` or
+    `remediation_success` — that timestamp reflects how long the harness
+    polled before giving up (or its own timeout constant), not a real
+    repair time.
+    """
+    id5 = uuid.uuid4()
+    rows = [
+        EventRow(1, id5, "pod_crash", "anomaly_detected", T0, {}, None, None),
+        EventRow(2, id5, "pod_crash", "diagnosis", T1, {"cause": "transient_pod_failure", "confidence": 0.95, "evidence_cited": [], "action": "restart_pod"}, 0.95, 50),
+        EventRow(3, id5, "pod_crash", "approval", T1, {"action": None, "approved": False, "reason": "no action proposed"}, None, 5),
+        EventRow(
+            4,
+            id5,
+            "pod_crash",
+            "verification",
+            T2,
+            {"recovered": False, "manually_closed_by_harness": True, "reason": "escalated_by_approver"},
+            None,
+            None,
+        ),
+    ]
+    stats = report.aggregate_results(rows)
+    assert stats["pod_crash"].mttr_s == []
+    assert stats["pod_crash"].remediation_success == 0
+    # escalation counting (approval.approved is False) is untouched by this
+    assert stats["pod_crash"].escalations == 1
+
+
+def test_aggregate_results_harness_closed_wins_even_if_real_verification_is_later():
+    """`by_stage` only keeps the LAST row per stage (rows are id-ordered),
+    so if the harness's synthetic failure row is followed by a later,
+    genuine orchestrator `verification` row with `recovered: True` (e.g. a
+    race where the pipeline actually finishes resolving an incident the
+    harness had already given up on), the incident must still be treated
+    as harness-closed — a late real row must not flip a timed-out/
+    escalated incident into a counted success.
+    """
+    id6 = uuid.uuid4()
+    rows = [
+        EventRow(1, id6, "pod_crash", "anomaly_detected", T0, {}, None, None),
+        EventRow(
+            2,
+            id6,
+            "pod_crash",
+            "verification",
+            T1,
+            {"recovered": False, "manually_closed_by_harness": True, "reason": "harness_resolution_timeout"},
+            None,
+            None,
+        ),
+        # Arrives later (higher id) and would win in a naive "last row per
+        # stage" dict.
+        EventRow(3, id6, "pod_crash", "verification", T2, {"recovered": True}, None, 30),
+    ]
+    stats = report.aggregate_results(rows)
+    assert stats["pod_crash"].mttr_s == []
+    assert stats["pod_crash"].remediation_success == 0
+
+
 def test_aggregate_results_memory_pressure_diagnosis_correct_accepts_rule_priority_quirk():
     """documented in orchestrator/orchestrator/main.py's module docstring and
     task-16-report.md section 11: because diagnoser.diagnose checks the
