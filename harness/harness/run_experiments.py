@@ -12,8 +12,10 @@ actually performs detection/diagnosis/approval/fix/verification — this
 script only injects chaos and observes Postgres; it never calls any
 pipeline stage directly.
 
-This script is NOT unit tested (see `harness/tests/test_report.py` for the
-one pure function in this package, `report.aggregate_results`, which is).
+Most of this script drives the live cluster/Postgres directly and is NOT
+unit tested (see `harness/tests/test_report.py` for `report.aggregate_results`,
+which is pure and tested). The one pure function in *this* module,
+`compute_true_mttr_times`, is unit tested in `harness/tests/test_run_experiments.py`.
 It requires:
   - `kubectl` on PATH, configured against the running Minikube cluster.
   - `DATABASE_URL` in the environment, pointing at the cluster's Postgres.
@@ -362,8 +364,13 @@ def compute_true_mttr_times(
     `manually_closed_by_harness: True` (mirrors `aggregate_results`'s own
     `mttr_s` exclusion — that timestamp reflects how long the harness
     polled before giving up, not a real repair time). Among the remaining,
-    genuine `verification` rows for an incident, the earliest one's `ts` is
-    used.
+    genuine `verification` rows for an incident, only rows with
+    `recovered: True` are eligible, and the earliest such row's `ts` is
+    used; an incident with no `recovered: True` verification row never
+    actually recovered, so it contributes nothing to this average rather
+    than a bogus "repair time" (mirrors `aggregate_results`'s own
+    `remediation_success`/`mttr_s` pattern of gating on `recovered is
+    True` — see `report.py`'s module docstring).
     """
     rows_by_incident: dict[Any, list[db.EventRow]] = {}
     for row in all_rows:
@@ -380,7 +387,10 @@ def compute_true_mttr_times(
             continue
         if any(r.payload.get("manually_closed_by_harness") for r in verification_rows):
             continue
-        verification_ts = min(r.ts for r in verification_rows)
+        recovered_rows = [r for r in verification_rows if r.payload.get("recovered") is True]
+        if not recovered_rows:
+            continue
+        verification_ts = min(r.ts for r in recovered_rows)
         true_mttr_times.setdefault(t["scenario"], []).append(
             (verification_ts - t["injection_ts"]).total_seconds()
         )
