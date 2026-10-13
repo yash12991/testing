@@ -46,7 +46,10 @@ def build_evidence(
     The exact PromQL/LogQL strings issued here are an implementation detail
     not pinned by unit tests (the real queries against a live Prometheus/
     Loki are written in Task 16); what matters is that every signal a
-    scenario's threshold check depends on gets populated.
+    scenario's threshold check depends on gets populated — with one known
+    exception: `p99_latency_rising` is a stub (see the comment at its
+    assignment below) and is always False until Task 16 lands real trend
+    detection.
     """
     restart_count_delta = int(
         prom_client.query(
@@ -78,6 +81,11 @@ def build_evidence(
         error_rate=error_rate,
         cpu_ratio=cpu_ratio,
         p99_latency_ms=p99_latency_ms,
+        # Known stub: real trend detection (comparing p99 latency across
+        # windows to decide whether it's rising) needs a second, earlier
+        # query and is deferred to Task 16's real Prometheus client. Until
+        # then this is hardcoded False, so cpu_stress incidents can only be
+        # detected once that lands.
         p99_latency_rising=False,
         oom_killed=oom_killed,
         mem_ratio=mem_ratio,

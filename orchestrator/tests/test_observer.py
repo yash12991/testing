@@ -37,13 +37,20 @@ class FakePromClient:
 
     def query(self, promql: str) -> float:
         self.queries.append(promql)
+        # Route on substrings that are actually present in the real PromQL
+        # strings `build_evidence` issues (see observer.py), not on words
+        # like "error" or "latency" that never appear verbatim in them —
+        # the real error_rate query is built from `http_requests_total` and
+        # `status=~"5.."`, with no literal "error" substring, so matching
+        # on "error" silently fell through to the 0.0 default below
+        # regardless of what was configured on this fake.
         if "restart" in promql:
             return self.restart_count_delta
-        if "error" in promql:
+        if 'status=~"5.."' in promql:
             return self.error_rate
         if "cpu" in promql:
             return self.cpu_ratio
-        if "latency" in promql or "p99" in promql or "bucket" in promql:
+        if "bucket" in promql:
             return self.p99_latency_ms
         if "mem" in promql:
             return self.mem_ratio
@@ -180,7 +187,7 @@ def test_check_threshold_memory_pressure_does_not_breach_below_both():
 def test_build_evidence_assembles_summary_from_clients():
     fake_prom = FakePromClient(
         restart_count_delta=3,
-        error_rate=0.0,
+        error_rate=0.42,
         cpu_ratio=0.2,
         p99_latency_ms=120,
         mem_ratio=0.3,
@@ -188,8 +195,18 @@ def test_build_evidence_assembles_summary_from_clients():
     fake_loki = FakeLokiClient()
     evidence = observer.build_evidence(fake_prom, fake_loki, "pod_crash", "cartservice", 300)
     assert isinstance(evidence, EvidenceSummary)
+    # Assert every field build_evidence populates, not just target and
+    # restart_count_delta — a fake-routing bug that silently defaulted one
+    # of the other signals to 0.0 would otherwise go unnoticed here (as
+    # happened previously with error_rate; see FakePromClient.query above).
     assert evidence.target == "cartservice"
     assert evidence.restart_count_delta == 3
+    assert evidence.error_rate == 0.42
+    assert evidence.cpu_ratio == 0.2
+    assert evidence.p99_latency_ms == 120
+    assert evidence.p99_latency_rising is False
+    assert evidence.mem_ratio == 0.3
+    assert evidence.oom_killed is False
     assert fake_prom.queries  # the client was actually queried
 
 
@@ -209,8 +226,22 @@ def test_poll_once_skips_scenario_with_open_incident(db_conn):
     fake_prom = FakePromClient(restart_count_delta=5)  # would otherwise breach
     observer.poll_once(fake_prom, FakeLokiClient(), db_conn, [("pod_crash", "cartservice")])
 
+    # A correct skip happens before any evidence-building, so the dedup check
+    # must short-circuit prior to querying Prometheus at all. This is the
+    # strongest guarantee against a regression that deletes the dedup check:
+    # since `incidents` has no uniqueness constraint on (scenario, target)
+    # and `create_incident` always mints a fresh UUID, a missing dedup check
+    # would create a *second*, separate incident (with its own
+    # anomaly_detected event) rather than appending to the existing one — so
+    # asserting only the original incident's event list would not catch it.
+    assert fake_prom.queries == []  # no evidence was ever queried
+
     rows = db.get_events(db_conn, incident_id)
-    assert len(rows) == 1  # no second anomaly_detected row created
+    assert len(rows) == 1  # no second anomaly_detected row created on the original incident
+
+    # Still exactly one open incident for this (scenario, target) pair, and
+    # it's still the original one — not a second incident created alongside it.
+    assert db.get_open_incident(db_conn, "pod_crash", "cartservice") == incident_id
 
 
 def test_poll_once_creates_incident_on_breach(db_conn):
