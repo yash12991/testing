@@ -1,0 +1,53 @@
+# loki-values.yaml
+#
+# Override values for the grafana/loki-stack Helm chart (single-binary Loki
+# + Promtail), installed into the `monitoring` namespace alongside
+# kube-prometheus-stack (see prometheus-values.yaml for why resources are
+# trimmed: single Minikube node shared with Online Boutique, and later
+# Chaos Mesh + Postgres).
+#
+# loki-stack's own chart defaults already have no Grafana, no Prometheus,
+# no persistence (chunks/index live on the pod's ephemeral storage) and no
+# resource requests/limits set, so there is little to disable here beyond
+# making sure Promtail (the log shipper) is on and capping resources
+# explicitly rather than relying on the chart's unbounded defaults.
+
+loki:
+  enabled: true
+  persistence:
+    enabled: false
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+promtail:
+  enabled: true
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# These are not needed: Grafana is already provided by neither chart in
+# this phase, and loki-stack's bundled Prometheus/fluent-bit/filebeat are
+# redundant with the dedicated kube-prometheus-stack install.
+grafana:
+  enabled: false
+
+prometheus:
+  enabled: false
+
+fluent-bit:
+  enabled: false
+
+filebeat:
+  enabled: false
+
+logstash:
+  enabled: false

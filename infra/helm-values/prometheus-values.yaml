@@ -1,0 +1,75 @@
+# prometheus-values.yaml
+#
+# Override values for the prometheus-community/kube-prometheus-stack Helm
+# chart, installed into the `monitoring` namespace of the Minikube cluster
+# used for the chaos-engineering / auto-remediation pipeline.
+#
+# This cluster is a single Minikube node that also runs Online Boutique
+# (12 services) and will later run Chaos Mesh + Postgres on top. Grafana and
+# Alertmanager are disabled because they are not needed for this phase and
+# each would add another pod competing for the node's limited memory.
+# Prometheus's own resources/retention are capped low for the same reason
+# (see task-3-report.md for the actual free-memory numbers observed on this
+# host).
+#
+# serviceMonitorSelectorNilUsesHelmValues: false (and the matching
+# podMonitor/rule settings below) make the Prometheus Operator pick up
+# ServiceMonitors/PodMonitors/PrometheusRules created in ANY namespace, not
+# just the `monitoring` release namespace, so Prometheus scrapes targets
+# across online-boutique, chaos-mesh, etc.
+
+grafana:
+  enabled: false
+
+alertmanager:
+  enabled: false
+
+prometheus:
+  prometheusSpec:
+    # Scrape ServiceMonitors/PodMonitors/Rules from all namespaces, not just
+    # the ones carrying the chart's release label.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+
+    # Short retention: this is a dev/chaos-testing cluster, not a
+    # long-lived observability deployment. Keeps the TSDB small on a
+    # memory-constrained node.
+    retention: 6h
+    retentionSize: ""
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
