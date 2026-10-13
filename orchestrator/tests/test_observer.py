@@ -27,12 +27,14 @@ class FakePromClient:
         cpu_ratio: float = 0.0,
         p99_latency_ms: float = 0.0,
         mem_ratio: float = 0.0,
+        oom_killed: bool = False,
     ):
         self.restart_count_delta = restart_count_delta
         self.error_rate = error_rate
         self.cpu_ratio = cpu_ratio
         self.p99_latency_ms = p99_latency_ms
         self.mem_ratio = mem_ratio
+        self.oom_killed = oom_killed
         self.queries: list[str] = []
 
     def query(self, promql: str) -> float:
@@ -44,6 +46,14 @@ class FakePromClient:
         # `status=~"5.."`, with no literal "error" substring, so matching
         # on "error" silently fell through to the 0.0 default below
         # regardless of what was configured on this fake.
+        #
+        # The OOMKilled check must be routed before "restart"/"mem": the
+        # kube_pod_container_status_last_terminated_reason query contains
+        # neither "restart" nor "mem", but routing order is checked
+        # defensively anyway since all the substring checks are on the
+        # same string.
+        if "OOMKilled" in promql:
+            return 1.0 if self.oom_killed else 0.0
         if "restart" in promql:
             return self.restart_count_delta
         if 'status=~"5.."' in promql:
@@ -58,14 +68,22 @@ class FakePromClient:
 
 
 class FakeLokiClient:
-    """Returns a fixed list of log lines for every LogQL query."""
+    """Returns a fixed list of log lines for every LogQL query.
+
+    `build_evidence` no longer calls `query_range` at all (oom_killed is
+    now detected via a Prometheus kube-state-metrics query instead — see
+    FakePromClient's "OOMKilled" routing above and
+    `test_build_evidence_does_not_query_loki`), but the fake is kept around
+    for tests exercising the interface directly and for any future
+    log-based signal.
+    """
 
     def __init__(self, lines: list[str] | None = None, oom_killed: bool = False):
         self.lines = lines if lines is not None else []
         self.oom_killed = oom_killed
         self.queries: list[str] = []
 
-    def query_range(self, logql: str) -> list[str]:
+    def query_range(self, logql: str, window_seconds: int = 3600) -> list[str]:
         self.queries.append(logql)
         if self.oom_killed:
             return self.lines + ["OOMKilled"]
@@ -86,7 +104,11 @@ def test_check_threshold_pod_crash_breaches_on_restart_delta():
     assert observer.check_threshold("pod_crash", evidence) is True
 
 
-def test_check_threshold_pod_crash_breaches_on_error_rate():
+def test_check_threshold_pod_crash_ignores_error_rate_alone():
+    # error_rate was dropped from pod_crash's threshold: no Online Boutique
+    # service exports http_requests_total, so error_rate is always 0.0 in
+    # practice and could never contribute a real signal anyway. Simplified
+    # per Task 16: restart_count_delta > 0 is the only leg now.
     evidence = EvidenceSummary(
         restart_count_delta=0,
         error_rate=0.2,
@@ -97,7 +119,7 @@ def test_check_threshold_pod_crash_breaches_on_error_rate():
         mem_ratio=0.1,
         target="cartservice",
     )
-    assert observer.check_threshold("pod_crash", evidence) is True
+    assert observer.check_threshold("pod_crash", evidence) is False
 
 
 def test_check_threshold_pod_crash_does_not_breach_with_no_signal():
@@ -114,7 +136,13 @@ def test_check_threshold_pod_crash_does_not_breach_with_no_signal():
     assert observer.check_threshold("pod_crash", evidence) is False
 
 
-def test_check_threshold_cpu_stress_requires_both_signals():
+def test_check_threshold_cpu_stress_breaches_on_cpu_ratio_alone():
+    # p99_latency_rising was dropped from cpu_stress's threshold: no Online
+    # Boutique service exports a latency histogram, so p99_latency_rising
+    # is always False in practice and could never contribute a real
+    # signal anyway. Simplified per Task 16: cpu_ratio > 0.85 is the only
+    # leg now, so this breaches even though latency isn't (and can never
+    # be reported as) rising.
     evidence = EvidenceSummary(
         restart_count_delta=0,
         error_rate=0.0,
@@ -125,7 +153,21 @@ def test_check_threshold_cpu_stress_requires_both_signals():
         mem_ratio=0.1,
         target="recommendationservice",
     )
-    assert observer.check_threshold("cpu_stress", evidence) is False  # latency not rising yet
+    assert observer.check_threshold("cpu_stress", evidence) is True
+
+
+def test_check_threshold_cpu_stress_does_not_breach_below_ratio():
+    evidence = EvidenceSummary(
+        restart_count_delta=0,
+        error_rate=0.0,
+        cpu_ratio=0.5,
+        p99_latency_ms=50,
+        p99_latency_rising=True,
+        oom_killed=False,
+        mem_ratio=0.1,
+        target="recommendationservice",
+    )
+    assert observer.check_threshold("cpu_stress", evidence) is False
 
 
 def test_check_threshold_cpu_stress_breaches_when_both_signals_present():
@@ -210,13 +252,82 @@ def test_build_evidence_assembles_summary_from_clients():
     assert fake_prom.queries  # the client was actually queried
 
 
-def test_build_evidence_detects_oom_killed_from_logs():
-    fake_prom = FakePromClient()
-    fake_loki = FakeLokiClient(oom_killed=True)
+def test_build_evidence_detects_oom_killed_from_prometheus():
+    # oom_killed now comes from a kube-state-metrics Prometheus query, not
+    # Loki (Loki only scrapes container stdout/stderr; OOMKilled is a
+    # termination *reason*, never a log line, so searching Loki for it
+    # could never match).
+    fake_prom = FakePromClient(oom_killed=True)
+    fake_loki = FakeLokiClient()
     evidence = observer.build_evidence(
         fake_prom, fake_loki, "memory_pressure", "productcatalogservice", 300
     )
     assert evidence.oom_killed is True
+
+
+def test_build_evidence_oom_killed_false_when_prometheus_reports_no_match():
+    fake_prom = FakePromClient(oom_killed=False)
+    fake_loki = FakeLokiClient()
+    evidence = observer.build_evidence(
+        fake_prom, fake_loki, "memory_pressure", "productcatalogservice", 300
+    )
+    assert evidence.oom_killed is False
+
+
+def test_build_evidence_does_not_query_loki():
+    # Loki's query_range machinery is left in place on the client (for
+    # potential future log-based signals) but build_evidence no longer
+    # calls it for anything — oom_killed moved to Prometheus.
+    fake_prom = FakePromClient()
+    fake_loki = FakeLokiClient()
+    observer.build_evidence(fake_prom, fake_loki, "memory_pressure", "productcatalogservice", 300)
+    assert fake_loki.queries == []
+
+
+def test_build_evidence_filters_cpu_and_mem_ratio_by_container():
+    # cpu_ratio/mem_ratio must filter on container="server" (the real
+    # container name for every target, verified against
+    # infra/manifests/online-boutique/kubernetes-manifests.yaml) so the
+    # avg() doesn't get diluted by the near-zero "pause" sandbox
+    # container's series.
+    fake_prom = FakePromClient()
+    fake_loki = FakeLokiClient()
+    observer.build_evidence(fake_prom, fake_loki, "cpu_stress", "recommendationservice", 300)
+
+    cpu_queries = [q for q in fake_prom.queries if "container_cpu_usage_seconds_total" in q]
+    cpu_limit_queries = [
+        q for q in fake_prom.queries if "kube_pod_container_resource_limits" in q and 'resource="cpu"' in q
+    ]
+    mem_queries = [q for q in fake_prom.queries if "container_memory_working_set_bytes" in q]
+    mem_limit_queries = [
+        q
+        for q in fake_prom.queries
+        if "kube_pod_container_resource_limits" in q and 'resource="memory"' in q
+    ]
+    assert cpu_queries and all('container="server"' in q for q in cpu_queries)
+    assert cpu_limit_queries and all('container="server"' in q for q in cpu_limit_queries)
+    assert mem_queries and all('container="server"' in q for q in mem_queries)
+    assert mem_limit_queries and all('container="server"' in q for q in mem_limit_queries)
+
+
+def test_build_evidence_restart_query_uses_short_window_regardless_of_arg():
+    # The restart-count query always uses observer.RESTART_WINDOW_SECONDS
+    # (60s), independent of whatever window_seconds the caller passes in
+    # for the other signals — a stale restart inside a long lookback
+    # window caused a spurious second incident shortly after a fix
+    # resolved the first one (see observer.py's RESTART_WINDOW_SECONDS
+    # comment).
+    fake_prom = FakePromClient()
+    fake_loki = FakeLokiClient()
+    observer.build_evidence(fake_prom, fake_loki, "pod_crash", "cartservice", window_seconds=300)
+
+    restart_queries = [q for q in fake_prom.queries if "restarts_total" in q]
+    assert restart_queries
+    assert all(f"[{observer.RESTART_WINDOW_SECONDS}s]" in q for q in restart_queries)
+    assert all("[300s]" not in q for q in restart_queries)
+
+    cpu_queries = [q for q in fake_prom.queries if "container_cpu_usage_seconds_total" in q]
+    assert cpu_queries and all("[300s]" in q for q in cpu_queries)
 
 
 def test_poll_once_skips_scenario_with_open_incident(db_conn):

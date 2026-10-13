@@ -75,7 +75,9 @@ from kubernetes import config as k8s_config
 from kubernetes.config.config_exception import ConfigException
 
 from . import approver, config, db, diagnoser, fixer, observer, verifier
+from .loki_client import LokiClient
 from .models import ApprovalDecision, Diagnosis, EvidenceSummary
+from .prom_client import PrometheusClient
 
 logger = logging.getLogger(__name__)
 
@@ -292,50 +294,6 @@ def run_once(
             _advance_incident(conn, prom_client, loki_client, core_v1, apps_v1, incident_id, confidence_threshold)
         except Exception:
             logger.exception("failed to advance incident %s; will retry next poll cycle", incident_id)
-
-
-class PrometheusClient:
-    """Minimal real Prometheus HTTP API client satisfying observer.PromClient.
-
-    This is a stopgap for Task 13 so `main()` is runnable end-to-end; the
-    plan assigns the real, hardened Prometheus/Loki clients to Task 16
-    ("Task 16 builds the real PrometheusClient/LokiClient to the same
-    shape"), which may replace this implementation entirely.
-    """
-
-    def __init__(self, base_url: str):
-        self._base_url = base_url.rstrip("/")
-
-    def query(self, promql: str) -> float:
-        import httpx
-
-        response = httpx.get(f"{self._base_url}/api/v1/query", params={"query": promql}, timeout=10.0)
-        response.raise_for_status()
-        result = response.json()["data"]["result"]
-        if not result:
-            return 0.0
-        return float(result[0]["value"][1])
-
-
-class LokiClient:
-    """Minimal real Loki HTTP API client satisfying observer.LokiClient.
-
-    See `PrometheusClient`'s docstring: a Task 13 stopgap, not the hardened
-    Task 16 implementation.
-    """
-
-    def __init__(self, base_url: str):
-        self._base_url = base_url.rstrip("/")
-
-    def query_range(self, logql: str) -> list[str]:
-        import httpx
-
-        response = httpx.get(
-            f"{self._base_url}/loki/api/v1/query_range", params={"query": logql}, timeout=10.0
-        )
-        response.raise_for_status()
-        streams = response.json()["data"]["result"]
-        return [value[1] for stream in streams for value in stream.get("values", [])]
 
 
 def main() -> None:

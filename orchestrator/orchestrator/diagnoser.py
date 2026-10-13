@@ -4,11 +4,18 @@
 rules in a fixed order and returns the first match:
 
 1. Pod crash      -> `transient_pod_failure`  (confidence 0.95, restart_pod)
-   Fires on `restart_count_delta > 0` or `error_rate > 0.1`.
+   Fires on `restart_count_delta > 0`.
 2. CPU stress     -> `resource_exhaustion`    (confidence 0.9,  scale_replicas)
-   Fires on `cpu_ratio > 0.85` and `p99_latency_rising`.
+   Fires on `cpu_ratio > 0.85`.
 3. Memory pressure-> `undersized_limit_or_leak` (confidence 0.85, restart_pod)
    Fires on `oom_killed` or `mem_ratio > 0.9`.
+
+Rules 1 and 2 were simplified from their original two-leg conditions
+(restart_count_delta > 0 OR error_rate > 0.1; cpu_ratio > 0.85 AND
+p99_latency_rising) down to their single reliable leg each, mirroring
+`observer.check_threshold`'s simplification: no Online Boutique service
+exports http_requests_total or any latency histogram, so error_rate and
+p99_latency_rising are always 0.0/False in practice.
 
 The thresholds mirror `observer.check_threshold` so that anything the Observer
 flags is diagnosable. The order only matters when evidence satisfies more than
@@ -29,25 +36,20 @@ UNKNOWN_CONFIDENCE = 0.0
 def diagnose(evidence: EvidenceSummary) -> Diagnosis:
     """Map `evidence` to a `Diagnosis` using the fixed decision table."""
     # Rule 1: pod crash.
-    pod_crash_fields = []
     if evidence.restart_count_delta > 0:
-        pod_crash_fields.append("restart_count_delta")
-    if evidence.error_rate > 0.1:
-        pod_crash_fields.append("error_rate")
-    if pod_crash_fields:
         return Diagnosis(
             cause="transient_pod_failure",
             confidence=TRANSIENT_POD_FAILURE_CONFIDENCE,
-            evidence_cited=pod_crash_fields,
+            evidence_cited=["restart_count_delta"],
             action="restart_pod",
         )
 
     # Rule 2: CPU stress.
-    if evidence.cpu_ratio > 0.85 and evidence.p99_latency_rising:
+    if evidence.cpu_ratio > 0.85:
         return Diagnosis(
             cause="resource_exhaustion",
             confidence=RESOURCE_EXHAUSTION_CONFIDENCE,
-            evidence_cited=["cpu_ratio", "p99_latency_rising"],
+            evidence_cited=["cpu_ratio"],
             action="scale_replicas",
         )
 

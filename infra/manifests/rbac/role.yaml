@@ -13,3 +13,14 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "patch"]
+  # The `scale_replicas` fix action calls
+  # apps_v1.patch_namespaced_deployment_scale, which operates on the
+  # deployments/scale *subresource* — granting "patch" on "deployments"
+  # above does not implicitly cover it; Kubernetes RBAC requires
+  # subresources to be listed explicitly. Discovered live in Task 16: a
+  # real cpu_stress incident reached fix_executed but the Fixer got back
+  # "(403) deployments/scale is forbidden" and the incident was correctly
+  # (but unhelpfully) reported as recovered=false.
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch"]

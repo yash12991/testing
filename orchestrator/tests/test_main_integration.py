@@ -29,23 +29,25 @@ class FakePromClient:
     """Routes on the same real PromQL substrings as test_observer.py's fake.
 
     With `breach_then_healthy_sequence=True`: the first `build_evidence`
-    call (5 `.query()` calls, in the fixed order `build_evidence` issues
-    them) reports a pod_crash breach (restart_count_delta > 0); every
-    `build_evidence` call after that reports a fully healthy pod.
-    `main.run_once`'s diagnosis step reads from the stored anomaly_detected
-    payload rather than re-querying, so `build_evidence` is never called by
-    diagnosis/approval/fixer. It IS called by `observer.poll_once`'s own
-    detection query — but only while there is no open incident yet for that
-    (scenario, target) pair, since `poll_once`'s dedup check skips the
-    pair entirely once an incident is open — and by the Verifier's post-fix
-    recovery check once `fix_executed` already exists. So across a test
-    with several `run_once` calls, `build_evidence` fires: once for the
-    call that first detects the breach, once for the call that verifies
-    the fix, and once more for any later call made after the incident
-    resolves and `poll_once` resumes polling that pair for a fresh anomaly.
+    call (6 `.query()` calls, in the fixed order `build_evidence` issues
+    them: restart, error_rate, cpu_ratio, p99_latency, mem_ratio, then the
+    kube-state-metrics OOM check) reports a pod_crash breach
+    (restart_count_delta > 0); every `build_evidence` call after that
+    reports a fully healthy pod. `main.run_once`'s diagnosis step reads
+    from the stored anomaly_detected payload rather than re-querying, so
+    `build_evidence` is never called by diagnosis/approval/fixer. It IS
+    called by `observer.poll_once`'s own detection query — but only while
+    there is no open incident yet for that (scenario, target) pair, since
+    `poll_once`'s dedup check skips the pair entirely once an incident is
+    open — and by the Verifier's post-fix recovery check once
+    `fix_executed` already exists. So across a test with several
+    `run_once` calls, `build_evidence` fires: once for the call that first
+    detects the breach, once for the call that verifies the fix, and once
+    more for any later call made after the incident resolves and
+    `poll_once` resumes polling that pair for a fresh anomaly.
     """
 
-    QUERIES_PER_BUILD = 5
+    QUERIES_PER_BUILD = 6
 
     def __init__(self, breach_then_healthy_sequence: bool = False):
         self.breach_then_healthy_sequence = breach_then_healthy_sequence
@@ -56,6 +58,8 @@ class FakePromClient:
         self.queries.append(promql)
         self.call_count += 1
         breaching = self.breach_then_healthy_sequence and self.call_count <= self.QUERIES_PER_BUILD
+        if "OOMKilled" in promql:
+            return 0.0
         if "restart" in promql:
             return 3.0 if breaching else 0.0
         if 'status=~"5.."' in promql:
@@ -70,7 +74,7 @@ class FakePromClient:
 
 
 class FakeLokiClient:
-    def query_range(self, logql: str) -> list[str]:
+    def query_range(self, logql: str, window_seconds: int = 3600) -> list[str]:
         return []
 
 
