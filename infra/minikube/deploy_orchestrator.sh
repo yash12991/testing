@@ -129,10 +129,22 @@ print(f"postgresql://{user}:{pw}@postgres.online-boutique.svc.cluster.local:5432
 ')"
 
   log "Creating/updating orchestrator-db-credentials Secret in ${NAMESPACE}"
-  kubectl create secret generic orchestrator-db-credentials \
-    --namespace "${NAMESPACE}" \
-    --from-literal=database-url="${database_url}" \
-    --dry-run=client -o yaml | kubectl apply -f -
+  # Built as YAML and piped to `kubectl apply -f -` over stdin (rather than
+  # passed via `--from-literal=...` on the command line) so the password
+  # embedded in database_url never appears as a process argument visible to
+  # other local users via `ps`/`/proc/<pid>/cmdline`.
+  local encoded_database_url
+  encoded_database_url="$(printf '%s' "${database_url}" | base64 -w0)"
+  kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orchestrator-db-credentials
+  namespace: ${NAMESPACE}
+type: Opaque
+data:
+  database-url: ${encoded_database_url}
+EOF
 }
 
 apply_deployment() {
