@@ -1,0 +1,52 @@
+# orchestrator-deployment.yaml - Runs the auto-remediation orchestrator
+# (Task 13's main.py poll loop) as a single-replica Deployment in the
+# `online-boutique` namespace, using the `orchestrator-sa` ServiceAccount
+# (Task 6) so the Fixer's pod-delete / deployment-scale-patch calls are
+# authorized by `orchestrator-role`.
+#
+# The image is built locally and loaded directly into the Minikube node's
+# containerd image store (no registry push) - see
+# infra/minikube/deploy_orchestrator.sh. `imagePullPolicy: Never` ensures
+# the kubelet uses that already-loaded image rather than attempting a
+# registry pull for the unqualified `localhost/orchestrator:dev` tag.
+#
+# DATABASE_URL's password comes from the `orchestrator-db-credentials`
+# Secret (created imperatively by deploy_orchestrator.sh from the gitignored
+# infra/minikube/.env.postgres, same pattern Task 5 used for Helm's --set)
+# rather than being embedded here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: online-boutique
+  labels:
+    app: orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+    spec:
+      serviceAccountName: orchestrator-sa
+      containers:
+        - name: orchestrator
+          image: localhost/orchestrator:dev
+          imagePullPolicy: Never
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: orchestrator-db-credentials
+                  key: database-url
+            - name: PROMETHEUS_URL
+              value: "http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090"
+            - name: LOKI_URL
+              value: "http://loki.monitoring.svc.cluster.local:3100"
+            - name: CONFIDENCE_THRESHOLD
+              value: "0.8"
+            - name: POLL_INTERVAL_SECONDS
+              value: "15"
