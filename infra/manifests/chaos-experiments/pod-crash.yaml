@@ -1,0 +1,42 @@
+# pod-crash.yaml
+#
+# Second-review "pod_crash" scenario: kills the running cartservice pod
+# outright (Chaos Mesh's `pod-kill` action deletes the Pod object). Online
+# Boutique's Deployment controller immediately schedules a brand-new
+# replacement pod — verified live against the cluster (see
+# task-15-report.md): the old pod disappears and a new one with a new
+# name/UID is `Running` within ~8s. This is a real, immediate chaos effect.
+#
+# Known gap (not in this task's scope — confirmed live, see
+# task-15-report.md; fixing observer.py is out of scope for this task,
+# which only writes the chaos manifests): because `pod-kill` replaces the
+# whole Pod object rather than restarting a container in place,
+# `kube_pod_container_status_restarts_total` — which counts in-place
+# container restarts within the SAME pod (crash loops, liveness-probe
+# kills) — starts fresh at 0 for the new pod rather than incrementing, so
+# the Observer's `restart_count_delta > 0` check never fires for this
+# action. `error_rate` (the threshold's other leg) is separately dead
+# cluster-wide: no `http_requests_total` metric exists for any Online
+# Boutique service (they're gRPC/Go binaries, not instrumented with that
+# metric name), so `error_rate` is always exactly 0.0. Together, the live
+# Observer currently cannot raise a pod_crash anomaly_detected event for
+# this (or any) target — this manifest is written exactly to this task's
+# specified values (`PodChaos`/`pod-kill`/`app: cartservice`) and produces
+# a real, verified chaos effect regardless.
+#
+# No `duration` is set: `pod-kill` is a one-shot action (duration is only
+# required for `pod-failure`), so Chaos Mesh kills the selected pod once and
+# immediately reports the experiment Finished.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: pod-crash-cartservice
+  namespace: online-boutique
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - online-boutique
+    labelSelectors:
+      app: cartservice

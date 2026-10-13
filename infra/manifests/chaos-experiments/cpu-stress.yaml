@@ -1,0 +1,51 @@
+# cpu-stress.yaml
+#
+# Second-review "cpu_stress" scenario: pegs recommendationservice's CPU.
+# recommendationservice's container has `resources.limits.cpu: 200m`
+# (infra manifests for Online Boutique), so 2 stress-ng workers at 100%
+# load genuinely saturate the pod's cgroup CPU quota: verified live against
+# the cluster (see task-15-report.md) that the actual `server` container's
+# own `rate(container_cpu_usage_seconds_total{...,container="server"}[30s])`
+# plateaus at ~0.2 cores — i.e. ~100% of its 200m limit, a real and strong
+# chaos effect.
+#
+# duration: 600s is deliberately >> 2x POLL_INTERVAL_SECONDS (15s default,
+# see orchestrator/orchestrator/config.py) and also well past the 300s
+# lookback window the Observer's PromQL queries use
+# (`poll_once` calls `build_evidence(..., window_seconds=300)`), so that by
+# the time any poll fires, the entire trailing 300s rate() window is
+# saturated by the stress load rather than diluted by pre-stress idle CPU.
+#
+# Known gaps (not in this task's scope — both confirmed live, see
+# task-15-report.md — fixing observer.py is out of scope for this task,
+# which only writes the chaos manifests):
+#   1. observer.py's exact `cpu_ratio` query —
+#      `avg(rate(container_cpu_usage_seconds_total{pod=~"recommendationservice.*"}[300s]))
+#      / avg(kube_pod_container_resource_limits{...})` — has no `container=`
+#      filter, so its numerator averages THREE cAdvisor series for this one
+#      pod (the pod-cgroup aggregate, the near-zero `pause` sandbox
+#      container, and the real `server` container), diluting the true ~1.0
+#      per-container ratio down to a measured plateau of ~0.63 — never
+#      `> 0.85`, regardless of how hard this manifest stresses the CPU.
+#   2. `check_threshold`'s cpu_stress branch also requires
+#      `p99_latency_rising`, which `observer.build_evidence()` hardcodes to
+#      `False` unconditionally (a stub pending Task 16's real trend-detection
+#      query), so even a fixed cpu_ratio query still couldn't raise this
+#      scenario's anomaly_detected event today.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: cpu-stress-recommendationservice
+  namespace: online-boutique
+spec:
+  mode: one
+  selector:
+    namespaces:
+      - online-boutique
+    labelSelectors:
+      app: recommendationservice
+  stressors:
+    cpu:
+      workers: 2
+      load: 100
+  duration: 600s

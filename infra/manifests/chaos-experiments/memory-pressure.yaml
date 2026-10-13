@@ -1,0 +1,51 @@
+# memory-pressure.yaml
+#
+# Second-review "memory_pressure" scenario: drives productcatalogservice's
+# memory usage past its limit. productcatalogservice's container has
+# `resources.limits.memory: 128Mi` (baseline working set ~10-16MiB via
+# `container_memory_working_set_bytes`, see task-15-report.md), so one
+# stress-ng vm worker allocating 140MiB pushes total cgroup memory usage
+# well above the 128Mi hard limit, which the kernel's cgroup memory
+# controller enforces by killing a process in that cgroup.
+#
+# Verified live against the cluster (see task-15-report.md): this reliably
+# causes a genuine container kill/restart (`kubectl describe pod` shows
+# `Last State: Terminated, Reason: Error, Exit Code: 137` and the pod's
+# `RESTARTS` count increments) within ~15s of injection — a real, strong,
+# immediate chaos effect, well inside `duration`.
+#
+# Chaos Mesh's `oomScoreAdj` field (tried during verification to coax the
+# kernel into picking productcatalogservice's own PID 1, rather than the
+# injected stress-ng process, as the OOM victim so Kubernetes would report
+# `Reason: OOMKilled` verbatim) backfired: setting it very low (-999)
+# suppressed the kill entirely for the whole observation window instead, so
+# it is deliberately left unset here in favor of the kernel's default
+# victim selection, which reliably produces a real, promptly observable
+# kill/restart.
+#
+# `size: 140MiB` uses the unit Chaos Mesh's `vstresschaos.kb.io` admission
+# webhook actually accepts for this field (`B/KB/KiB/MB/MiB/...`) — plain
+# `140Mi` (the Kubernetes quantity suffix used elsewhere, e.g. in resource
+# limits) is rejected at apply time with "incorrect bytes format: invalid
+# suffix: 'mi'".
+#
+# duration: 600s is deliberately >> 2x POLL_INTERVAL_SECONDS (15s default)
+# so the Observer's ~15s polling loop has many chances to sample the
+# effect, though in practice the kill/restart lands almost immediately.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: memory-pressure-productcatalogservice
+  namespace: online-boutique
+spec:
+  mode: one
+  selector:
+    namespaces:
+      - online-boutique
+    labelSelectors:
+      app: productcatalogservice
+  stressors:
+    memory:
+      workers: 1
+      size: 140MiB
+  duration: 600s
