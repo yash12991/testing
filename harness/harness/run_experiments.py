@@ -339,6 +339,54 @@ def _fmt(value: float | None) -> str:
     return f"{value:.1f}" if value is not None else "n/a"
 
 
+def compute_true_mttr_times(
+    trial_log: list[dict[str, Any]], all_rows: list[db.EventRow]
+) -> dict[str, list[float]]:
+    """Compute the true injection-to-recovery MTTR per scenario: the
+    wall-clock gap between this harness's own `injection_ts` (recorded
+    right before `kubectl apply`) and the incident's real `verification.ts`
+    in Postgres.
+
+    Final-review Fix 1: `report.aggregate_results`'s `mttr_s` field is
+    `anomaly_detected.ts -> verification.ts` (detection-to-recovery), not
+    the spec's actual MTTR (injection-to-recovery) — and in practice it's
+    dominated by the Verifier's fixed ~30s backoff regardless of scenario,
+    badly understating the true repair time. This function fills that gap
+    the same way `main()` already overwrites `detection_times_s` after the
+    fact with the true `injection -> anomaly_detected` wall-clock
+    measurement (see `report.py`'s module docstring): `aggregate_results`
+    itself has no `injection_ts` to work from, so only this harness (which
+    issued the `kubectl apply`) can compute the true MTTR.
+
+    An incident is excluded entirely if any of its `verification` rows has
+    `manually_closed_by_harness: True` (mirrors `aggregate_results`'s own
+    `mttr_s` exclusion — that timestamp reflects how long the harness
+    polled before giving up, not a real repair time). Among the remaining,
+    genuine `verification` rows for an incident, the earliest one's `ts` is
+    used.
+    """
+    rows_by_incident: dict[Any, list[db.EventRow]] = {}
+    for row in all_rows:
+        rows_by_incident.setdefault(row.incident_id, []).append(row)
+
+    true_mttr_times: dict[str, list[float]] = {}
+    for t in trial_log:
+        incident_id = t["incident_id"]
+        if incident_id is None:
+            continue
+        incident_rows = rows_by_incident.get(incident_id, [])
+        verification_rows = [r for r in incident_rows if r.stage == "verification"]
+        if not verification_rows:
+            continue
+        if any(r.payload.get("manually_closed_by_harness") for r in verification_rows):
+            continue
+        verification_ts = min(r.ts for r in verification_rows)
+        true_mttr_times.setdefault(t["scenario"], []).append(
+            (verification_ts - t["injection_ts"]).total_seconds()
+        )
+    return true_mttr_times
+
+
 def write_report(
     stats: dict[str, report.ScenarioStats],
     trial_log: list[dict[str, Any]],
@@ -357,9 +405,10 @@ def write_report(
     lines.append("")
     lines.append(
         "| scenario | attempted | detected | diagnosis_correct | remediation_success | "
-        "mean detection (s) | mean MTTR (s) | escalations | timed_out | not_detected |"
+        "mean detection (s) | mean detection→recovery (s) | mean MTTR (s) [injection→recovery] | "
+        "escalations | timed_out | not_detected |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
 
     for scenario, _target, _manifest in scenarios_run:
         attempted = sum(1 for t in trial_log if t["scenario"] == scenario)
@@ -368,8 +417,8 @@ def write_report(
         s = stats.get(scenario, report.ScenarioStats(scenario=scenario))
         lines.append(
             f"| {scenario} | {attempted} | {s.runs} | {s.diagnosis_correct} | {s.remediation_success} | "
-            f"{_fmt(_mean(s.detection_times_s))} | {_fmt(_mean(s.mttr_s))} | {s.escalations} | "
-            f"{timed_out} | {not_detected} |"
+            f"{_fmt(_mean(s.detection_times_s))} | {_fmt(_mean(s.mttr_s))} | {_fmt(_mean(s.true_mttr_s))} | "
+            f"{s.escalations} | {timed_out} | {not_detected} |"
         )
 
     lines.append("")
@@ -377,9 +426,43 @@ def write_report(
         "`detection (s)` is the true wall-clock gap between this harness's `kubectl apply` "
         "and the Observer's `anomaly_detected` row (see `report.py`'s module docstring for why "
         "`aggregate_results` itself cannot compute this and `main()` overwrites it below). "
-        "`MTTR (s)` is `anomaly_detected -> verification`, recorded for every incident that "
-        "reached verification regardless of outcome. `diagnosis_correct`/`remediation_success` "
-        "are counted against `detected`, not `attempted`."
+        "`detection→recovery (s)` is `aggregate_results`'s `mttr_s` field: `anomaly_detected -> "
+        "verification`, recorded for every incident that reached verification regardless of "
+        "outcome. Despite what its field name suggests, THIS IS NOT THE SPEC'S MTTR METRIC — it "
+        "is detection-to-recovery, dominated in practice by the Verifier's fixed ~30s backoff "
+        "regardless of scenario, so it badly understates true repair time. "
+        "`MTTR (s) [injection→recovery]` is the actual spec metric: the wall-clock gap between "
+        "this harness's `kubectl apply` (`injection_ts`) and the incident's real `verification` "
+        "row in Postgres, computed the same way `detection (s)` is (see "
+        "`compute_true_mttr_times`). `diagnosis_correct`/`remediation_success` are counted "
+        "against `detected`, not `attempted`."
+    )
+    lines.append("")
+    lines.append("## Interpreting these results")
+    lines.append("")
+    lines.append(
+        "- **pod_crash's \"remediation success\" may partly reflect Kubernetes' own "
+        "self-healing, not solely the orchestrator's fix.** `pod-crash.yaml` uses Chaos Mesh's "
+        "`container-kill` action, which is one-shot: the kubelet restarts the killed container "
+        "in place within seconds, independent of whether the Fixer's `restart_pod` action (which "
+        "deletes the pod so Kubernetes reschedules it) ever ran. Verification happens within the "
+        "~60s window after `fix_executed`, by which point the kubelet may have already restarted "
+        "the container on its own. So a `recovered: True` / `remediation_success` count for "
+        "pod_crash does not cleanly isolate \"the orchestrator fixed it\" from \"Kubernetes "
+        "would have fixed it anyway regardless of what the orchestrator did.\" This is a known, "
+        "documented limitation of the current chaos-injection timing for this scenario, not "
+        "something this report's numbers correct for — read pod_crash's remediation_success "
+        "with that caveat in mind."
+    )
+    lines.append(
+        "- **cpu_stress's `cpu_ratio` now uses `max(...)` across matching pods, not `avg(...)` "
+        "(final-review Fix 3).** Averaging previously meant that once `scale_replicas` added "
+        "idle replicas, the cluster-wide average diluted below threshold even though Chaos "
+        "Mesh's `mode: one` selector kept stressing only the original pod — so `recovered: True` "
+        "used to mean \"the average got diluted,\" not \"the stressed pod itself recovered.\" "
+        "With `max(...)`, verification now reflects the worst/most-stressed matching pod, which "
+        "is a more honest (and typically slower-to-satisfy, or possibly never-satisfied within "
+        "the resolution timeout) signal of real recovery."
     )
     lines.append("")
     lines.append("## Raw trial log")
@@ -480,6 +563,15 @@ def main() -> None:
     for scenario_name, times in true_detection_times.items():
         if scenario_name in stats:
             stats[scenario_name].detection_times_s = times
+
+    # True injection-to-recovery MTTR (final-review Fix 1) — see
+    # compute_true_mttr_times's docstring for why aggregate_results's own
+    # mttr_s field cannot compute this and this harness must overwrite it
+    # after the fact, mirroring true_detection_times above.
+    true_mttr_times = compute_true_mttr_times(trial_log, all_rows)
+    for scenario_name, times in true_mttr_times.items():
+        if scenario_name in stats:
+            stats[scenario_name].true_mttr_s = times
 
     out_path = write_report(
         stats, trial_log, scenarios_to_run, args.runs_per_scenario, Path(args.out_dir)

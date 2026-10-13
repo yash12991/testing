@@ -12,8 +12,8 @@
 #
 # DATABASE_URL's password comes from the `orchestrator-db-credentials`
 # Secret (created imperatively by deploy_orchestrator.sh from the gitignored
-# infra/minikube/.env.postgres, same pattern Task 5 used for Helm's --set)
-# rather than being embedded here.
+# infra/minikube/.env.postgres, read the same way deploy_postgres.sh reads
+# it) rather than being embedded here.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,6 +23,16 @@ metadata:
     app: orchestrator
 spec:
   replicas: 1
+  # Recreate (not the RollingUpdate default): the orchestrator has no
+  # SIGTERM handler (main.py's loop is a plain `while True` with no signal
+  # handling) and no unique-incident-write protection, so a RollingUpdate's
+  # brief old+new pod overlap during a redeploy could let both poll and
+  # double-process the same incident. Recreate tears down the old pod
+  # before starting the new one, trading a few seconds of downtime for
+  # eliminating that overlap risk entirely - acceptable for a
+  # single-replica dev/demo orchestrator.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: orchestrator

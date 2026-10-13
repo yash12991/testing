@@ -158,20 +158,34 @@ def test_aggregate_results_harness_closed_wins_even_if_real_verification_is_late
     assert stats["pod_crash"].remediation_success == 0
 
 
-def test_aggregate_results_memory_pressure_diagnosis_correct_accepts_rule_priority_quirk():
-    """documented in orchestrator/orchestrator/main.py's module docstring and
-    task-16-report.md section 11: because diagnoser.diagnose checks the
-    pod_crash rule before the memory_pressure rule, a real OOM kill that
-    also increments restart_count_delta (the common case) is classified as
-    `transient_pod_failure`, not `undersized_limit_or_leak` - both map to
-    the same `restart_pod` action and this is documented, correct,
-    non-buggy behavior, so a harness scoring diagnosis correctness for
-    memory_pressure must accept either cause.
+def test_aggregate_results_memory_pressure_accepts_only_undersized_limit_or_leak():
+    """Final-review Fix 2: diagnoser.diagnose now checks the memory_pressure
+    rule BEFORE the pod_crash rule, so a real OOM kill (which also
+    increments restart_count_delta by construction) correctly diagnoses as
+    `undersized_limit_or_leak`, not `transient_pod_failure`. EXPECTED_CAUSES
+    for memory_pressure no longer accepts `transient_pod_failure` as an
+    "accommodation" for the old (now-fixed) rule-priority quirk - accepting
+    it would mask a genuine misdiagnosis.
     """
     id4 = uuid.uuid4()
     rows = [
         EventRow(1, id4, "memory_pressure", "anomaly_detected", T0, {}, None, None),
-        EventRow(2, id4, "memory_pressure", "diagnosis", T1, {"cause": "transient_pod_failure", "confidence": 0.95, "evidence_cited": ["restart_count_delta"], "action": "restart_pod"}, 0.95, 50),
+        EventRow(2, id4, "memory_pressure", "diagnosis", T1, {"cause": "undersized_limit_or_leak", "confidence": 0.85, "evidence_cited": ["oom_killed"], "action": "restart_pod"}, 0.85, 50),
     ]
     stats = report.aggregate_results(rows)
     assert stats["memory_pressure"].diagnosis_correct == 1
+
+
+def test_aggregate_results_memory_pressure_rejects_transient_pod_failure_as_incorrect():
+    """A memory_pressure incident diagnosed as `transient_pod_failure` after
+    the rule-order fix would mean the pod_crash rule fired instead of the
+    memory rule - a genuine misdiagnosis, not the old accepted quirk - and
+    must now be scored as incorrect.
+    """
+    id7 = uuid.uuid4()
+    rows = [
+        EventRow(1, id7, "memory_pressure", "anomaly_detected", T0, {}, None, None),
+        EventRow(2, id7, "memory_pressure", "diagnosis", T1, {"cause": "transient_pod_failure", "confidence": 0.95, "evidence_cited": ["restart_count_delta"], "action": "restart_pod"}, 0.95, 50),
+    ]
+    stats = report.aggregate_results(rows)
+    assert stats["memory_pressure"].diagnosis_correct == 0

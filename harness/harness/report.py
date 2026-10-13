@@ -29,24 +29,37 @@ implementer (the brief's own worked examples only pin `runs`,
 
 - `diagnosis_correct`: scores the `diagnosis` stage's `cause` against the
   expected cause(s) for the incident's scenario, using `EXPECTED_CAUSES`
-  below. `memory_pressure` deliberately accepts two causes
-  (`transient_pod_failure` as well as `undersized_limit_or_leak`) because
-  of a documented, non-buggy quirk in `orchestrator.diagnoser.diagnose`'s
-  fixed rule-priority ordering (see `orchestrator/orchestrator/main.py`'s
-  module docstring and task-16-report.md section 11): a real OOM kill
-  almost always also increments `restart_count_delta`, so the pod_crash
-  rule (checked first) wins and the cause comes back
-  `transient_pod_failure` even though the true chaos scenario was
-  `memory_pressure` — both rules map to the same `restart_pod` action, so
-  this is correct, intended behavior, not a misdiagnosis, and scoring it as
-  "wrong" would be measuring an artifact of rule order rather than the
-  diagnoser's actual accuracy.
+  below. `memory_pressure` accepts exactly one cause,
+  `undersized_limit_or_leak`. It used to also accept `transient_pod_failure`
+  as an "accommodation" for a documented quirk in
+  `orchestrator.diagnoser.diagnose`'s fixed rule-priority ordering: because
+  the pod_crash rule was checked before the memory_pressure rule, and a real
+  OOM kill always also increments `restart_count_delta` (by construction —
+  see `observer.build_evidence`'s `oom_killed` gating), the pod_crash rule
+  always won and `undersized_limit_or_leak` could never actually be
+  produced for a real OOM incident. Final-review Fix 2 reordered
+  `diagnoser.diagnose` to check memory_pressure first, so that dead branch
+  is now live and a real OOM-with-restart correctly reports
+  `undersized_limit_or_leak`. Accepting `transient_pod_failure` here would
+  now mask a genuine misdiagnosis (the pod_crash rule firing instead of the
+  memory rule) rather than reflect a rule-order quirk, so it has been
+  removed from `EXPECTED_CAUSES`.
 
 - `mttr_s`: the `anomaly_detected.ts -> verification.ts` gap, recorded for
   every incident that reached a `verification` row regardless of whether
   it actually recovered (`remediation_success` separately tracks the
   recovered=True count) — this reports "how long until the pipeline reached
   a resolution attempt," a meaningful number even on a failed attempt.
+  IMPORTANT: despite the name, this is NOT the spec's MTTR metric
+  (injection-to-recovery) — it is detection-to-recovery, and in practice it
+  is dominated by the Verifier's fixed ~30s backoff regardless of scenario,
+  so it badly understates the true repair time (e.g. for cpu_stress, true
+  injection-to-recovery is ~7x this number). `run_experiments.py` separately
+  computes the true injection-to-recovery MTTR from its own wall-clock
+  `injection_ts` and writes it to `ScenarioStats.true_mttr_s` after calling
+  `aggregate_results` (mirroring the `detection_times_s` overwrite pattern
+  documented above) — `write_report`'s table labels this field's column
+  "detection→recovery" and reserves the "MTTR" label for `true_mttr_s`.
   EXCEPTION: an incident any of whose `verification` rows has
   `manually_closed_by_harness: True` (see `run_experiments.py`'s module
   docstring — the harness synthesizes this row when an incident escalates
@@ -99,15 +112,21 @@ class ScenarioStats:
     remediation_success: int = 0
     mttr_s: list[float] = field(default_factory=list)
     escalations: int = 0
+    # True injection-to-recovery MTTR (the spec's actual MTTR metric), left
+    # empty by `aggregate_results` (which has no injection timestamp to work
+    # from — see this module's docstring) and filled in by
+    # `run_experiments.py` after the fact, mirroring `detection_times_s`.
+    true_mttr_s: list[float] = field(default_factory=list)
 
 
 # Expected `diagnosis.cause` value(s) for each chaos scenario, per
-# `orchestrator.diagnoser.diagnose`'s fixed rule table. See this module's
-# docstring for why memory_pressure accepts two causes.
+# `orchestrator.diagnoser.diagnose`'s fixed rule table. memory_pressure
+# accepts only `undersized_limit_or_leak` — see this module's docstring for
+# why `transient_pod_failure` was removed from this set (final-review Fix 2).
 EXPECTED_CAUSES: dict[str, frozenset[str]] = {
     "pod_crash": frozenset({"transient_pod_failure"}),
     "cpu_stress": frozenset({"resource_exhaustion"}),
-    "memory_pressure": frozenset({"undersized_limit_or_leak", "transient_pod_failure"}),
+    "memory_pressure": frozenset({"undersized_limit_or_leak"}),
 }
 
 

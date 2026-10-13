@@ -16,22 +16,14 @@
 # the time any poll fires, the entire trailing 300s rate() window is
 # saturated by the stress load rather than diluted by pre-stress idle CPU.
 #
-# Known gaps (not in this task's scope — both confirmed live, see
-# task-15-report.md — fixing observer.py is out of scope for this task,
-# which only writes the chaos manifests):
-#   1. observer.py's exact `cpu_ratio` query —
-#      `avg(rate(container_cpu_usage_seconds_total{pod=~"recommendationservice.*"}[300s]))
-#      / avg(kube_pod_container_resource_limits{...})` — has no `container=`
-#      filter, so its numerator averages THREE cAdvisor series for this one
-#      pod (the pod-cgroup aggregate, the near-zero `pause` sandbox
-#      container, and the real `server` container), diluting the true ~1.0
-#      per-container ratio down to a measured plateau of ~0.63 — never
-#      `> 0.85`, regardless of how hard this manifest stresses the CPU.
-#   2. `check_threshold`'s cpu_stress branch also requires
-#      `p99_latency_rising`, which `observer.build_evidence()` hardcodes to
-#      `False` unconditionally (a stub pending Task 16's real trend-detection
-#      query), so even a fixed cpu_ratio query still couldn't raise this
-#      scenario's anomaly_detected event today.
+# Both gaps originally noted here (observer.py's cpu_ratio query missing a
+# container= filter, and check_threshold's cpu_stress branch requiring the
+# always-False p99_latency_rising stub) were fixed in Task 16: cpu_ratio
+# now filters on container="server" and check_threshold's cpu_stress branch
+# depends only on cpu_ratio > 0.85. The Observer can and does fire
+# anomaly_detected for this scenario in production (confirmed live, Task 17
+# and the final-review live validation). See observer.py for the current
+# query/threshold logic.
 apiVersion: chaos-mesh.org/v1alpha1
 kind: StressChaos
 metadata:

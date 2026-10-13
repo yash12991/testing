@@ -96,10 +96,22 @@ def build_evidence(
         f'sum(rate(http_requests_total{{service="{target}",status=~"5.."}}[{window_seconds}s]))'
         f' / sum(rate(http_requests_total{{service="{target}"}}[{window_seconds}s]))'
     )
+    # Wrapped in max(...), not avg(...): final-review Fix 3. After a
+    # scale_replicas fix adds idle replicas, averaging cpu_ratio across all
+    # matching pods dilutes the cluster-wide ratio well below threshold even
+    # though Chaos Mesh's `mode: one` selector keeps stressing only the
+    # ORIGINAL pod for its full duration - so Verifier's recovered=True was
+    # really just "the average got diluted by idle replicas," not "the
+    # stressed pod recovered." max() reports the worst/most-stressed
+    # matching pod's ratio instead, mirroring the max(...) pattern already
+    # used for oom_killed above. Since every matching pod (replicas of the
+    # same Deployment) shares the same resource limit, max(usage)/max(limit)
+    # equals max(usage)/limit, i.e. the true worst-case ratio - not an
+    # average-of-ratios artifact.
     cpu_ratio = prom_client.query(
-        f'avg(rate(container_cpu_usage_seconds_total'
+        f'max(rate(container_cpu_usage_seconds_total'
         f'{{pod=~"{target}.*",container="{TARGET_CONTAINER}"}}[{window_seconds}s]))'
-        f' / avg(kube_pod_container_resource_limits'
+        f' / max(kube_pod_container_resource_limits'
         f'{{pod=~"{target}.*",container="{TARGET_CONTAINER}",resource="cpu"}})'
     )
     p99_latency_ms = prom_client.query(

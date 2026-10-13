@@ -170,6 +170,30 @@ def _decision_from_payload(payload: dict[str, Any]) -> ApprovalDecision:
     )
 
 
+def _reconnect(conn: Any, database_url: str) -> Any:
+    """Close `conn` if possible and open a fresh connection to `database_url`.
+
+    Final-review Fix 4: `main()` used to open one psycopg connection at
+    startup and never reconnect; a dropped connection (Postgres restart,
+    network blip) raised `psycopg.OperationalError` from inside the poll
+    loop, which the old bare `except Exception` logged and swallowed
+    forever, leaving the orchestrator looping on a permanently dead
+    connection with no liveness probe to force a restart. `main()`'s loop
+    now catches `psycopg.OperationalError` specifically and calls this
+    helper to get a working connection before the next poll cycle.
+
+    `conn.close()` on an already-dead connection can itself raise; that is
+    swallowed here (there is nothing useful to do about it) since the
+    point is just to discard the unusable connection object and obtain a
+    fresh one regardless.
+    """
+    try:
+        conn.close()
+    except Exception:
+        logger.warning("error closing dead Postgres connection; discarding it anyway", exc_info=True)
+    return psycopg.connect(database_url, autocommit=True)
+
+
 def _get_incident_scenario_and_target(conn: Any, incident_id: Any) -> tuple[str, str] | None:
     row = conn.execute(
         "SELECT scenario, target FROM incidents WHERE id = %s", (incident_id,)
@@ -305,6 +329,43 @@ def run_once(
             logger.exception("failed to advance incident %s; will retry next poll cycle", incident_id)
 
 
+def _poll_cycle(
+    conn: Any,
+    prom_client: Any,
+    loki_client: Any,
+    core_v1: Any,
+    apps_v1: Any,
+    scenarios: list[tuple[str, str]],
+    confidence_threshold: float,
+    database_url: str,
+) -> Any:
+    """Run one `run_once` cycle, reconnecting to Postgres if it raises
+    `psycopg.OperationalError`, and swallowing any other exception so a bad
+    cycle doesn't crash the process. Returns the connection to use for the
+    *next* cycle (either `conn` unchanged, or a fresh reconnected one).
+
+    Factored out of `main()`'s `while True` loop (final-review Fix 4) so
+    the reconnect-on-OperationalError behavior is directly unit-testable
+    without needing a real Postgres/Kubernetes/Prometheus/Loki setup.
+    """
+    try:
+        run_once(conn, prom_client, loki_client, core_v1, apps_v1, scenarios, confidence_threshold)
+        return conn
+    except psycopg.OperationalError:
+        # `conn` is dead (Postgres restarted, a network blip killed the
+        # socket, ...). Reconnect now rather than looping forever on an
+        # unusable connection with every subsequent cycle silently doing
+        # nothing but logging the same error.
+        logger.exception("Postgres connection lost; reconnecting before the next poll cycle")
+        return _reconnect(conn, database_url)
+    except Exception:
+        # One bad poll cycle (e.g. a transient K8s/Prometheus outage not
+        # already caught inside run_once) must not crash the process and
+        # crash-loop the pod; log it and try again next interval.
+        logger.exception("poll cycle failed; will retry after the usual interval")
+        return conn
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     cfg = config.load_config()
@@ -326,14 +387,9 @@ def main() -> None:
         cfg.confidence_threshold,
     )
     while True:
-        try:
-            run_once(conn, prom_client, loki_client, core_v1, apps_v1, SCENARIOS, cfg.confidence_threshold)
-        except Exception:
-            # One bad poll cycle (e.g. a transient Postgres/K8s/Prometheus
-            # outage not already caught inside run_once) must not crash the
-            # process and crash-loop the pod; log it and try again next
-            # interval.
-            logger.exception("poll cycle failed; will retry after the usual interval")
+        conn = _poll_cycle(
+            conn, prom_client, loki_client, core_v1, apps_v1, SCENARIOS, cfg.confidence_threshold, cfg.database_url
+        )
         logger.info("poll cycle complete, sleeping %ss", cfg.poll_interval_seconds)
         time.sleep(cfg.poll_interval_seconds)
 

@@ -63,6 +63,37 @@ def test_diagnose_cpu_ratio_alone_yields_resource_exhaustion_without_latency_ris
     assert d.evidence_cited == ["cpu_ratio"]
 
 
+def test_diagnose_real_oom_with_restart_yields_undersized_limit_or_leak_not_pod_crash():
+    # Final-review Fix 2: observer.build_evidence gates oom_killed on
+    # restart_count_delta > 0, so a REAL OOM-killed incident always has
+    # restart_count_delta > 0 too. Before the rule-priority fix, the
+    # pod_crash rule (checked first) would win and this would misreport
+    # transient_pod_failure, making the memory_pressure rule's oom_killed
+    # branch dead code in production. The memory_pressure rule must now be
+    # checked first and win here.
+    evidence = EvidenceSummary(restart_count_delta=1, error_rate=0.0, cpu_ratio=0.1,
+                                p99_latency_ms=50, p99_latency_rising=False,
+                                oom_killed=True, mem_ratio=0.95, target="productcatalogservice")
+    d = diagnoser.diagnose(evidence)
+    assert d.cause == "undersized_limit_or_leak"
+    assert d.confidence == 0.85
+    assert d.action == "restart_pod"
+    assert "oom_killed" in d.evidence_cited
+
+
+def test_diagnose_plain_container_kill_still_yields_transient_pod_failure():
+    # A restart with NO oom_killed signal (e.g. container-kill chaos, not
+    # memory_pressure) must still correctly hit the pod_crash rule even
+    # after memory_pressure moved ahead of it in rule order.
+    evidence = EvidenceSummary(restart_count_delta=1, error_rate=0.0, cpu_ratio=0.1,
+                                p99_latency_ms=50, p99_latency_rising=False,
+                                oom_killed=False, mem_ratio=0.1, target="cartservice")
+    d = diagnoser.diagnose(evidence)
+    assert d.cause == "transient_pod_failure"
+    assert d.confidence == 0.95
+    assert d.action == "restart_pod"
+
+
 def test_diagnose_unrecognized_evidence_yields_unknown():
     evidence = EvidenceSummary(restart_count_delta=0, error_rate=0.0, cpu_ratio=0.1,
                                 p99_latency_ms=50, p99_latency_rising=False,

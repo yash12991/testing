@@ -13,9 +13,20 @@
 # Installs the chaos-mesh/chaos-mesh Helm chart (release: chaos-mesh) into
 # `chaos-mesh`, using infra/helm-values/chaos-mesh-values.yaml. See that
 # file's comments for why chaosDaemon.runtime is set to containerd (not
-# the chart's default docker) and why clusterScoped/targetNamespace (not a
-# webhook namespaceSelector) is used to restrict Chaos Mesh to the
-# online-boutique namespace.
+# the chart's default docker).
+#
+# IMPORTANT (corrected, final-review Fix 5 — this previously claimed the
+# opposite): `clusterScoped` is left at the chart default (`true`), with
+# cluster-wide RBAC — `targetNamespace`/`clusterScoped: false` is NOT used
+# and does NOT restrict Chaos Mesh to the online-boutique namespace at the
+# Helm/RBAC level (see chaos-mesh-values.yaml's comments for why that
+# namespace-scoped mode is actually broken in chart 2.8.4). Namespace
+# scoping here is ONLY a naming convention every chaos CR in this project
+# must follow: each manifest under infra/manifests/chaos-experiments/ sets
+# `spec.selector.namespaces: [online-boutique]` itself. Nothing in Helm or
+# RBAC enforces that convention — a future chaos manifest that omits or
+# changes that selector could target any namespace in the cluster, and
+# nothing here would stop it.
 #
 set -euo pipefail
 
