@@ -1,0 +1,37 @@
+# postgres-values.yaml
+#
+# Override values for the bitnami/postgresql Helm chart, installed into
+# the `online-boutique` namespace. Provides a single Postgres instance
+# backing the `incidents` database (table: incident_events) used by the
+# chaos-to-remediation pipeline to record incident lifecycle events.
+#
+# Credentials: auth.username/auth.password are NOT set here. Real values
+# live only in infra/minikube/.env.postgres (gitignored, never committed)
+# and are injected at install time by infra/minikube/deploy_postgres.sh via
+# `helm upgrade --install ... --set auth.username=... --set auth.password=...`,
+# sourced from that env file. This file only sets auth.database (not a
+# secret) plus sizing/architecture; see infra/minikube/.env.postgres.example
+# for the env file template.
+#
+# architecture: standalone (the chart's default) already means a single
+# Postgres pod/replica - no separate replica count to set. Node headroom on
+# this Minikube host is generous (~16 cpu / 23Gi shared across the single
+# node), so default primary.resources are left untouched - only
+# persistence size is trimmed down for the ~150+ row incident_events table
+# this pipeline expects.
+
+# Service/resource name override so the chart's Service is named exactly
+# `postgres` (giving the DNS name postgres.online-boutique.svc.cluster.local
+# required by later tasks' DATABASE_URL), instead of the chart's default
+# `<release-name>-postgresql` fullname.
+fullnameOverride: postgres
+
+auth:
+  database: incidents
+
+architecture: standalone
+
+primary:
+  persistence:
+    enabled: true
+    size: 1Gi
