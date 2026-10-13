@@ -78,9 +78,18 @@ def build_evidence(
     service exports a latency histogram to detect a trend from (confirmed
     structurally absent live).
     """
+    # Wrapped in sum(...): without it, PrometheusClient.query only reads
+    # result[0] of whatever Prometheus returns, i.e. an arbitrary one of
+    # the matching series when more than one pod matches `pod=~"{target}.*"`
+    # (a real situation - e.g. the old and new pod briefly coexist during
+    # restart_pod, or a target now runs multiple replicas after a
+    # scale_replicas fix). sum() is the right aggregation here because this
+    # is a count ("how many restarts happened"), not a flag - summing
+    # across matching pods gives the true total instead of picking
+    # whichever single series happened to come back first.
     restart_count_delta = int(
         prom_client.query(
-            f'increase(kube_pod_container_status_restarts_total{{pod=~"{target}.*"}}[{RESTART_WINDOW_SECONDS}s])'
+            f'sum(increase(kube_pod_container_status_restarts_total{{pod=~"{target}.*"}}[{RESTART_WINDOW_SECONDS}s]))'
         )
     )
     error_rate = prom_client.query(
@@ -111,13 +120,33 @@ def build_evidence(
     # PromClient.query's convention) otherwise. loki_client/query_range is
     # left in place for other, future log-based signals; it's just no
     # longer used for this one.
-    oom_killed = (
+    #
+    # Wrapped in max(...) rather than sum(): this is a boolean-ish flag
+    # across pods ("is ANY matching pod currently showing this"), not a
+    # count, so summing multiple matching pods could produce a value > 1
+    # that still means exactly the same thing as 1 - max() is both correct
+    # and avoids the same result[0]-picks-an-arbitrary-series problem
+    # sum() fixes for restart_count_delta above.
+    #
+    # Gated on a RECENT restart (the same RESTART_WINDOW_SECONDS window
+    # computed above for restart_count_delta): the kube-state-metrics gauge
+    # above stays at 1 for as long as the pod object exists, with no time
+    # scoping at all - a pod that OOMed hours ago and has been healthy
+    # since would otherwise report oom_killed=True forever, and because a
+    # verification row permanently resolves an incident with no retry, any
+    # fix that doesn't literally replace the pod object (e.g. anything
+    # other than restart_pod) would then always read back recovered=False.
+    # Requiring restart_count_delta > 0 (a real restart within the last
+    # RESTART_WINDOW_SECONDS) means a stale, long-resolved OOM event no
+    # longer counts as a live signal.
+    oom_killed_flag = (
         prom_client.query(
-            f'kube_pod_container_status_last_terminated_reason'
-            f'{{reason="OOMKilled",pod=~"{target}.*",container="{TARGET_CONTAINER}"}}'
+            f'max(kube_pod_container_status_last_terminated_reason'
+            f'{{reason="OOMKilled",pod=~"{target}.*",container="{TARGET_CONTAINER}"}})'
         )
         > 0
     )
+    oom_killed = oom_killed_flag and restart_count_delta > 0
 
     return EvidenceSummary(
         target=target,

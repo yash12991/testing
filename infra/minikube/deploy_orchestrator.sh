@@ -151,6 +151,20 @@ apply_deployment() {
   log "Applying ${DEPLOYMENT_MANIFEST}"
   kubectl apply -f "${DEPLOYMENT_MANIFEST}"
 
+  # `kubectl apply` alone is a no-op whenever the manifest YAML itself
+  # didn't change - but the image behind the static ${IMAGE_TAG} tag can
+  # still have changed CONTENT (that's the whole point of this script:
+  # rebuild + reload a new image under the same tag). Combined with
+  # imagePullPolicy: Never (required since there's no registry - see the
+  # Deployment manifest), the kubelet has no trigger to ever notice: it
+  # never re-pulls, so the OLD container keeps running under the SAME pod,
+  # and `rollout status` below reports success even though the code did
+  # not actually change. Confirmed live. `rollout restart` forces a fresh
+  # pod (and therefore a fresh image pull/use) unconditionally on every
+  # run of this script, regardless of whether the manifest YAML changed.
+  log "Restarting the orchestrator Deployment to pick up the freshly loaded image"
+  kubectl rollout restart deployment/orchestrator -n "${NAMESPACE}"
+
   log "Waiting for the orchestrator Deployment to become available"
   kubectl rollout status deployment/orchestrator -n "${NAMESPACE}" --timeout=120s
 }

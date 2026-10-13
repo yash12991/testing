@@ -21,6 +21,11 @@ rules:
   # real cpu_stress incident reached fix_executed but the Fixer got back
   # "(403) deployments/scale is forbidden" and the incident was correctly
   # (but unhelpfully) reported as recovered=false.
+  #
+  # "patch" only (no "get"): fixer.py's scale_replicas calls
+  # patch_namespaced_deployment_scale and nothing else — it never reads
+  # the scale subresource — so granting "get" here would be an unused
+  # permission.
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
-    verbs: ["get", "patch"]
+    verbs: ["patch"]

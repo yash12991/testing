@@ -256,8 +256,9 @@ def test_build_evidence_detects_oom_killed_from_prometheus():
     # oom_killed now comes from a kube-state-metrics Prometheus query, not
     # Loki (Loki only scrapes container stdout/stderr; OOMKilled is a
     # termination *reason*, never a log line, so searching Loki for it
-    # could never match).
-    fake_prom = FakePromClient(oom_killed=True)
+    # could never match). It also requires a recent restart (see the next
+    # two tests) - restart_count_delta=1 here stands in for that.
+    fake_prom = FakePromClient(oom_killed=True, restart_count_delta=1)
     fake_loki = FakeLokiClient()
     evidence = observer.build_evidence(
         fake_prom, fake_loki, "memory_pressure", "productcatalogservice", 300
@@ -266,12 +267,43 @@ def test_build_evidence_detects_oom_killed_from_prometheus():
 
 
 def test_build_evidence_oom_killed_false_when_prometheus_reports_no_match():
-    fake_prom = FakePromClient(oom_killed=False)
+    fake_prom = FakePromClient(oom_killed=False, restart_count_delta=1)
     fake_loki = FakeLokiClient()
     evidence = observer.build_evidence(
         fake_prom, fake_loki, "memory_pressure", "productcatalogservice", 300
     )
     assert evidence.oom_killed is False
+
+
+def test_build_evidence_oom_killed_false_without_recent_restart():
+    # The kube_pod_container_status_last_terminated_reason gauge has no
+    # time scoping at all - it stays at 1 for as long as the pod object
+    # lives, even if the OOM happened hours ago and the pod has been
+    # healthy since. Gating on a recent restart (restart_count_delta > 0,
+    # the same RESTART_WINDOW_SECONDS window) is what stops a stale,
+    # long-resolved OOM from triggering memory_pressure detection forever.
+    fake_prom = FakePromClient(oom_killed=True, restart_count_delta=0)
+    fake_loki = FakeLokiClient()
+    evidence = observer.build_evidence(
+        fake_prom, fake_loki, "memory_pressure", "productcatalogservice", 300
+    )
+    assert evidence.oom_killed is False
+    assert (
+        observer.check_threshold(
+            "memory_pressure",
+            EvidenceSummary(
+                target="productcatalogservice",
+                restart_count_delta=0,
+                error_rate=0.0,
+                cpu_ratio=0.0,
+                p99_latency_ms=0.0,
+                p99_latency_rising=False,
+                oom_killed=evidence.oom_killed,
+                mem_ratio=0.1,
+            ),
+        )
+        is False
+    )
 
 
 def test_build_evidence_does_not_query_loki():
@@ -328,6 +360,36 @@ def test_build_evidence_restart_query_uses_short_window_regardless_of_arg():
 
     cpu_queries = [q for q in fake_prom.queries if "container_cpu_usage_seconds_total" in q]
     assert cpu_queries and all("[300s]" in q for q in cpu_queries)
+
+
+def test_build_evidence_restart_query_aggregates_across_matching_pods():
+    # PrometheusClient.query only reads result[0] of whatever Prometheus
+    # returns, so an unaggregated query over pod=~"<target>.*" could read
+    # an arbitrary one of several matching pods (e.g. old+new pod briefly
+    # coexisting during restart_pod, or multiple replicas after
+    # scale_replicas). sum(...) aggregates the restart count across all
+    # matching series into a single value instead.
+    fake_prom = FakePromClient()
+    fake_loki = FakeLokiClient()
+    observer.build_evidence(fake_prom, fake_loki, "pod_crash", "cartservice", 300)
+
+    restart_queries = [q for q in fake_prom.queries if "restarts_total" in q]
+    assert restart_queries
+    assert all(q.startswith("sum(increase(") for q in restart_queries)
+
+
+def test_build_evidence_oom_query_aggregates_across_matching_pods():
+    # Same result[0]-picks-an-arbitrary-series risk as restart_count_delta,
+    # but max(...) is the correct aggregation here (not sum()): this is a
+    # boolean-ish flag ("is ANY matching pod currently showing this"), not
+    # a count to total up across pods.
+    fake_prom = FakePromClient()
+    fake_loki = FakeLokiClient()
+    observer.build_evidence(fake_prom, fake_loki, "memory_pressure", "productcatalogservice", 300)
+
+    oom_queries = [q for q in fake_prom.queries if "OOMKilled" in q]
+    assert oom_queries
+    assert all(q.startswith("max(kube_pod_container_status_last_terminated_reason") for q in oom_queries)
 
 
 def test_poll_once_skips_scenario_with_open_incident(db_conn):

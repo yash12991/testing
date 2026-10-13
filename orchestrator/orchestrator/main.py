@@ -98,20 +98,29 @@ SCENARIOS: list[tuple[str, str]] = [
 
 # `build_evidence`'s lookback window used by the verification lambda in
 # `_advance_incident`. This is intentionally NOT the same 300s window
-# `observer.poll_once` uses for original detection (see observer.py, which
-# hardcodes its own 300s independently). Verification runs only ~one poll
+# `observer.poll_once` always passes for original detection (see
+# observer.py's `poll_once`, which hardcodes window_seconds=300
+# independently of this constant). Verification runs only ~one poll
 # interval plus VERIFY_BACKOFF_SECONDS after the fix was applied (tens of
-# seconds), but a 300s window would still contain the pre-fix breach
-# signal: for pod_crash, `increase(...restarts_total[300s])` would still
-# see the restarts that happened before the fix; for memory_pressure,
-# pre-fix OOMKilled log lines would still be inside a 300s-equivalent
-# lookback. A verification row permanently resolves (or fails to resolve)
-# the incident — there's no retry — so a stale window would read the old
-# breach and wrongly report `recovered=False` forever, silently corrupting
-# every chaos run's measured recovery outcome (Task 17's harness depends
-# on this being accurate). This window is sized to roughly "time since the
-# fix was applied" instead: long enough for a stable reading, short enough
-# to exclude the pre-fix breach.
+# seconds), but a 300s window here would still contain the pre-fix breach
+# for the signals that use `window_seconds` directly (cpu_ratio, mem_ratio,
+# error_rate, p99_latency_ms). restart_count_delta and oom_killed are
+# exceptions to that: restart_count_delta always queries over its own
+# short, independent RESTART_WINDOW_SECONDS (60s, see observer.py)
+# regardless of what window_seconds is passed here, and oom_killed (a
+# kube-state-metrics gauge via `kube_pod_container_status_last_terminated_
+# reason`, which otherwise has no time scoping at all - see observer.py)
+# is gated on that same RESTART_WINDOW_SECONDS restart check, precisely so
+# a stale, long-resolved OOM event from before the fix can't keep
+# verification stuck at recovered=False forever. For the remaining
+# window_seconds-driven signals, though, a verification row permanently
+# resolves (or fails to resolve) the incident - there's no retry - so a
+# stale window would read the old breach and wrongly report
+# `recovered=False` forever, silently corrupting every chaos run's
+# measured recovery outcome (Task 17's harness depends on this being
+# accurate). This window is sized to roughly "time since the fix was
+# applied" instead: long enough for a stable reading, short enough to
+# exclude the pre-fix breach.
 VERIFY_WINDOW_SECONDS = 60
 
 # Default verifier backoff per the plan's Global Constraints ("Verifier
