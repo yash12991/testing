@@ -1,0 +1,17 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: network-latency-shippingservice
+  namespace: online-boutique
+spec:
+  action: delay
+  mode: one
+  selector:
+    namespaces:
+      - online-boutique
+    labelSelectors:
+      app: shippingservice
+  delay:
+    latency: "250ms"
+    jitter: "20ms"
+  duration: 300s

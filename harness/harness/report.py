@@ -127,6 +127,8 @@ EXPECTED_CAUSES: dict[str, frozenset[str]] = {
     "pod_crash": frozenset({"transient_pod_failure"}),
     "cpu_stress": frozenset({"resource_exhaustion"}),
     "memory_pressure": frozenset({"undersized_limit_or_leak"}),
+    "network_latency": frozenset({"degraded_dependency_or_network_congestion"}),
+    "service_unavailability": frozenset({"service_down_or_unreachable"}),
 }
 
 
@@ -164,7 +166,8 @@ def aggregate_results(rows: list[EventRowLike]) -> dict[str, ScenarioStats]:
         # escalated/timed-out close can't silently override it — see this
         # module's docstring.
         verification_harness_closed = any(
-            row.stage == "verification" and row.payload.get("manually_closed_by_harness")
+            row.stage == "verification"
+            and (row.payload.get("manually_closed_by_harness") or row.payload.get("manually_closed"))
             for row in incident_rows
         )
 

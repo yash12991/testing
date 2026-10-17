@@ -60,3 +60,33 @@ def test_get_incomplete_incidents_excludes_verified_ones(db_conn):
     db.append_event(db_conn, closed_id, "anomaly_detected", {})
     db.append_event(db_conn, closed_id, "verification", {"recovered": True})
     assert db.get_incomplete_incidents(db_conn) == [open_id]
+
+
+def test_resolve_incident_closes_incident_with_audit_trail(db_conn):
+    incident_id = db.create_incident(db_conn, "pod_crash", "cartservice")
+    db.append_event(db_conn, incident_id, "anomaly_detected", {})
+    assert db.get_open_incident(db_conn, "pod_crash", "cartservice") == incident_id
+
+    # Operationally resolve/close the incident
+    db.resolve_incident(
+        db_conn, incident_id, resolution="operator_override", recovered=True, detail="manually verified"
+    )
+    assert db.get_open_incident(db_conn, "pod_crash", "cartservice") is None
+    events = db.get_events(db_conn, incident_id)
+    last_event = events[-1]
+    assert last_event.stage == "verification"
+    assert last_event.payload["manually_closed"] is True
+    assert last_event.payload["resolution"] == "operator_override"
+
+
+def test_close_stale_incidents_resolves_old_incidents(db_conn):
+    incident_id = db.create_incident(db_conn, "cpu_stress", "recommendationservice")
+    db.append_event(db_conn, incident_id, "anomaly_detected", {})
+
+    # Set created_at to 1 hour ago
+    db_conn.execute("UPDATE incidents SET created_at = now() - interval '1 hour' WHERE id = %s", (incident_id,))
+
+    closed = db.close_stale_incidents(db_conn, timeout_seconds=300)
+    assert incident_id in closed
+    assert db.get_open_incident(db_conn, "cpu_stress", "recommendationservice") is None
+

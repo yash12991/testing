@@ -27,14 +27,21 @@ def verify(
     check_threshold_fn: Callable[[str, EvidenceSummary], bool],
     sleep_fn: Callable[[float], None] = time.sleep,
     backoff_seconds: int = 30,
+    sample_count: int = 1,
+    sample_interval_seconds: float = 5.0,
 ) -> VerificationResult:
-    """Wait `backoff_seconds`, take one reading, and report whether it recovered.
+    """Wait `backoff_seconds`, then verify recovery across `sample_count` consecutive samples.
 
-    Calls `sleep_fn(backoff_seconds)` once, then `build_evidence_fn()` once,
-    then `check_threshold_fn(scenario, evidence)` once. `recovered` is True
-    iff the threshold check comes back False (no longer breaching).
+    Rule V1 & V2: waits `backoff_seconds` for cluster stabilization.
+    If `sample_count == 1`: takes exactly one reading.
+    If `sample_count > 1`: verifies sustained health across `sample_count` consecutive
+    samples separated by `sample_interval_seconds`. If any sample breaches, recovered=False.
     """
     sleep_fn(backoff_seconds)
-    evidence = build_evidence_fn()
-    recovered = not check_threshold_fn(scenario, evidence)
-    return VerificationResult(recovered, checked_at=datetime.now(timezone.utc))
+    for i in range(sample_count):
+        if i > 0 and sample_interval_seconds > 0:
+            sleep_fn(sample_interval_seconds)
+        evidence = build_evidence_fn()
+        if check_threshold_fn(scenario, evidence):
+            return VerificationResult(recovered=False, checked_at=datetime.now(timezone.utc))
+    return VerificationResult(recovered=True, checked_at=datetime.now(timezone.utc))

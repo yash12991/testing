@@ -129,3 +129,58 @@ def get_incomplete_incidents(conn: Connection) -> list[uuid.UUID]:
         """
     ).fetchall()
     return [row[0] for row in rows]
+
+
+def resolve_incident(
+    conn: Connection,
+    incident_id: uuid.UUID,
+    resolution: str = "operator_override",
+    recovered: bool = False,
+    detail: str = "",
+) -> None:
+    """Manually or operationally resolve/close an incident so it no longer blocks deduplication.
+
+    Appends a terminal verification event documenting the manual closure, ensuring
+    both full auditability and preventing pipeline deduplication deadlocks.
+    """
+    append_event(
+        conn,
+        incident_id,
+        "verification",
+        {
+            "recovered": recovered,
+            "resolution": resolution,
+            "manually_closed": True,
+            "detail": detail,
+        },
+    )
+
+
+def close_stale_incidents(conn: Connection, timeout_seconds: int = 600) -> list[uuid.UUID]:
+    """Find incomplete incidents older than `timeout_seconds` and close them with a timed-out verification event."""
+    rows = conn.execute(
+        """
+        SELECT i.id
+        FROM incidents i
+        WHERE i.created_at < now() - (%s || ' seconds')::interval
+          AND EXISTS (
+              SELECT 1 FROM incident_events e
+              WHERE e.incident_id = i.id AND e.stage = 'anomaly_detected'
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM incident_events e2
+              WHERE e2.incident_id = i.id AND e2.stage = 'verification'
+          )
+        """,
+        (timeout_seconds,),
+    ).fetchall()
+    stale_ids = [r[0] for r in rows]
+    for inc_id in stale_ids:
+        resolve_incident(
+            conn,
+            inc_id,
+            resolution="timed_out",
+            recovered=False,
+            detail=f"incident timed out after {timeout_seconds}s without verification",
+        )
+    return stale_ids

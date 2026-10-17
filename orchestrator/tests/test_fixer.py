@@ -87,6 +87,22 @@ def test_scale_replicas_patches_with_requested_replica_count():
     assert kwargs["body"]["spec"]["replicas"] == 5
 
 
+def test_scale_replicas_clamps_to_max_replicas():
+    apps_v1 = Mock()
+    result = fixer.scale_replicas(apps_v1, NAMESPACE, "recommendationservice", 25, min_replicas=1, max_replicas=10)
+    _, kwargs = apps_v1.patch_namespaced_deployment_scale.call_args
+    assert kwargs["body"]["spec"]["replicas"] == 10
+    assert "clamped from 25" in result.detail
+
+
+def test_scale_replicas_clamps_to_min_replicas():
+    apps_v1 = Mock()
+    result = fixer.scale_replicas(apps_v1, NAMESPACE, "recommendationservice", 0, min_replicas=1, max_replicas=10)
+    _, kwargs = apps_v1.patch_namespaced_deployment_scale.call_args
+    assert kwargs["body"]["spec"]["replicas"] == 1
+    assert "clamped from 0" in result.detail
+
+
 # --- rollback_deployment ----------------------------------------------------
 
 
@@ -103,6 +119,25 @@ def test_rollback_deployment_patches_deployment():
         success=True,
         detail="rolled back deployment productcatalogservice",
     )
+
+
+def test_rollback_deployment_restores_previous_replicaset_template():
+    apps_v1 = Mock()
+    rs_current = Mock()
+    rs_current.metadata.annotations = {"deployment.kubernetes.io/revision": "2"}
+    rs_current.spec.template = {"metadata": {"labels": {"version": "v2"}}}
+
+    rs_prev = Mock()
+    rs_prev.metadata.annotations = {"deployment.kubernetes.io/revision": "1"}
+    rs_prev.spec.template = {"metadata": {"labels": {"version": "v1"}}}
+
+    apps_v1.list_namespaced_replica_set.return_value = Mock(items=[rs_current, rs_prev])
+    result = fixer.rollback_deployment(apps_v1, NAMESPACE, "frontend")
+    apps_v1.patch_namespaced_deployment.assert_called_once()
+    _, kwargs = apps_v1.patch_namespaced_deployment.call_args
+    assert kwargs["body"]["spec"]["template"] == {"metadata": {"labels": {"version": "v1"}}}
+    assert result.success is True
+
 
 
 # --- execute: dispatch -------------------------------------------------------

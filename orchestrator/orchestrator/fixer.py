@@ -25,7 +25,12 @@ from kubernetes.client.exceptions import ApiException
 
 from orchestrator.models import FixResult
 
-DEFAULT_SCALE_REPLICAS = 3
+import os
+import time
+
+DEFAULT_MIN_REPLICAS = int(os.environ.get("MIN_REPLICAS", "1"))
+DEFAULT_MAX_REPLICAS = int(os.environ.get("MAX_REPLICAS", "10"))
+DEFAULT_SCALE_REPLICAS = int(os.environ.get("DEFAULT_SCALE_REPLICAS", "3"))
 
 
 def restart_pod(core_v1, namespace: str, target: str) -> FixResult:
@@ -44,27 +49,56 @@ def restart_pod(core_v1, namespace: str, target: str) -> FixResult:
     return FixResult(action="restart_pod", target=target, success=True, detail=f"deleted pod {pod_name}")
 
 
-def scale_replicas(apps_v1, namespace: str, target: str, replicas: int) -> FixResult:
-    """Patch Deployment `target`'s `spec.replicas` to `replicas`."""
+def scale_replicas(
+    apps_v1,
+    namespace: str,
+    target: str,
+    replicas: int = DEFAULT_SCALE_REPLICAS,
+    min_replicas: int = DEFAULT_MIN_REPLICAS,
+    max_replicas: int = DEFAULT_MAX_REPLICAS,
+) -> FixResult:
+    """Patch Deployment `target`'s `spec.replicas` to `replicas`, clamped to [min_replicas, max_replicas]."""
+    clamped_replicas = max(min_replicas, min(replicas, max_replicas))
     apps_v1.patch_namespaced_deployment_scale(
         name=target,
         namespace=namespace,
-        body={"spec": {"replicas": replicas}},
+        body={"spec": {"replicas": clamped_replicas}},
     )
+    detail = f"scaled {target} to {clamped_replicas} replicas"
+    if clamped_replicas != replicas:
+        detail += f" (clamped from {replicas} to [{min_replicas}, {max_replicas}])"
     return FixResult(
         action="scale_replicas",
         target=target,
         success=True,
-        detail=f"scaled {target} to {replicas} replicas",
+        detail=detail,
     )
 
 
 def rollback_deployment(apps_v1, namespace: str, target: str) -> FixResult:
-    """Trigger a rollout restart of Deployment `target` (available but unused by the current scenarios)."""
+    """Roll back Deployment `target` to its previous revision via ReplicaSets or rollback annotation."""
+    body = {"spec": {"template": {"metadata": {"annotations": {"orchestrator/rollback": "true"}}}}}
+    try:
+        rs_resp = apps_v1.list_namespaced_replica_set(namespace, label_selector=f"app={target}")
+        items = getattr(rs_resp, "items", None)
+        if items and isinstance(items, list) and len(items) > 1:
+            def _get_rev(rs):
+                try:
+                    return int(rs.metadata.annotations.get("deployment.kubernetes.io/revision", 0))
+                except Exception:
+                    return 0
+
+            sorted_rs = sorted(items, key=_get_rev, reverse=True)
+            prev_rs = sorted_rs[1]
+            if hasattr(prev_rs, "spec") and hasattr(prev_rs.spec, "template") and prev_rs.spec.template is not None:
+                body = {"spec": {"template": prev_rs.spec.template}}
+    except Exception:
+        pass
+
     apps_v1.patch_namespaced_deployment(
         name=target,
         namespace=namespace,
-        body={"spec": {"template": {"metadata": {"annotations": {"orchestrator/rollback": "true"}}}}},
+        body=body,
     )
     return FixResult(
         action="rollback_deployment",

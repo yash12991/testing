@@ -446,3 +446,18 @@ def test_poll_once_handles_multiple_scenarios_independently(db_conn):
 
     assert db.get_open_incident(db_conn, "pod_crash", "cartservice") is not None
     assert db.get_open_incident(db_conn, "cpu_stress", "recommendationservice") is None
+
+
+def test_check_threshold_network_latency():
+    breaching = EvidenceSummary(target="shippingservice", p99_latency_ms=250.0)
+    normal = EvidenceSummary(target="shippingservice", p99_latency_ms=80.0)
+    assert observer.check_threshold("network_latency", breaching) is True
+    assert observer.check_threshold("network_latency", normal) is False
+
+
+def test_check_threshold_service_unavailability():
+    down = EvidenceSummary(target="paymentservice", available_replicas=0)
+    up = EvidenceSummary(target="paymentservice", available_replicas=1)
+    assert observer.check_threshold("service_unavailability", down) is True
+    assert observer.check_threshold("service_unavailability", up) is False
+

@@ -30,6 +30,7 @@ class EvidenceSummary:
     p99_latency_rising: bool = False
     oom_killed: bool = False
     mem_ratio: float = 0.0
+    available_replicas: int = 1
 
 
 @dataclass

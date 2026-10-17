@@ -2,7 +2,14 @@
 
 BTP project (IIIT Kottayam) building a bounded, reproducible Kubernetes chaos-engineering and auto-remediation pipeline. A chaos engine injects a labelled fault into a demo microservice application; a deterministic Observer detects it from Prometheus/Loki signals; a rule-based Diagnoser identifies the probable cause; a deterministic Approver gates the proposed fix against a confidence threshold and a whitelist of actions; a deterministic Fixer executes the fix against the Kubernetes API; a deterministic Verifier checks recovery. Every stage communicates only by reading and writing rows in Postgres — never by calling another stage's code directly — so every incident is independently replayable and auditable.
 
-This README covers the **second-review build**: the rule-based diagnosis path, fully working end-to-end against a live cluster for three scenarios (pod crash, CPU stress, memory pressure). LLM-based diagnosis, the network-latency and service-unavailable scenarios, and the full RQ1–RQ4 comparative evaluation are later-phase work per the project's own timeline (see `docs/superpowers/specs/`).
+This README covers the **second-review build**: the rule-based diagnosis path, fully working end-to-end for all five deterministic scenarios:
+1. **Pod crash** (`cartservice` -> `transient_pod_failure` -> `restart_pod`)
+2. **CPU stress** (`recommendationservice` -> `resource_exhaustion` -> `scale_replicas` / multi-tier `restart_pod`)
+3. **Memory pressure** (`productcatalogservice` -> `undersized_limit_or_leak` -> `restart_pod`)
+4. **Network latency** (`shippingservice` -> `degraded_dependency_or_network_congestion` -> `restart_pod`)
+5. **Service unavailability** (`paymentservice` -> `service_down_or_unreachable` -> `rollback_deployment`)
+
+LLM-based diagnosis and comparative evaluation (RQ1–RQ4) are reserved for Review 3 per the project's phased roadmap.
 
 For the full build history — every task, what was found, what was fixed, and why — see [`results/BUILD_LOG.md`](results/BUILD_LOG.md). For the live evaluation numbers, see [`results/EVALUATION.md`](results/EVALUATION.md).
 
@@ -24,12 +31,12 @@ Chaos Mesh --injects fault--> Online Boutique (Minikube, namespace: online-bouti
                        harness/ (repeated-trial evaluation runner)
 ```
 
-- **Observer** (`orchestrator/orchestrator/observer.py`): polls Prometheus/Loki on a fixed interval, applies fixed thresholds per scenario, and on breach creates a new incident + `anomaly_detected` row.
-- **Diagnoser** (`orchestrator/orchestrator/diagnoser.py`): pure rule-based decision table — the *only* place an LLM would plug in later; currently fully deterministic.
-- **Approver** (`orchestrator/orchestrator/approver.py`): checks confidence ≥ threshold and that the proposed action is one of three whitelisted actions.
-- **Fixer** (`orchestrator/orchestrator/fixer.py`): executes exactly one of `restart_pod`, `scale_replicas`, `rollback_deployment` via the Kubernetes API — no shell, no `exec`, no dynamically generated YAML.
-- **Verifier** (`orchestrator/orchestrator/verifier.py`): re-checks the triggering metric after a backoff and records whether the system actually recovered.
-- **main.py**: the poll loop. Each `run_once()` call advances every incomplete incident by exactly the stages it's ready for, driven purely by what's already in Postgres (so a crashed/restarted orchestrator resumes correctly with no lost state).
+- **Observer** (`orchestrator/orchestrator/observer.py`): polls Prometheus/Loki on a fixed interval, evaluates telemetry thresholds across all 5 fault scenarios, and creates new incidents with structured evidence payloads.
+- **Diagnoser** (`orchestrator/orchestrator/diagnoser.py`): pure priority-ordered rule table mapping telemetry symptoms to diagnosed root causes with deterministic confidence scoring.
+- **Approver** (`orchestrator/orchestrator/approver.py`): safety gate validating confidence thresholds and action whitelisting (`restart_pod`, `scale_replicas`, `rollback_deployment`).
+- **Fixer** (`orchestrator/orchestrator/fixer.py`): executes Kubernetes mutations with bounded replica clamping (`MIN_REPLICAS`, `MAX_REPLICAS`), genuine Deployment revision rollback from historical ReplicaSets, and structured execution reporting.
+- **Verifier** (`orchestrator/orchestrator/verifier.py`): verifies recovery with configurable backoff and multi-sample sustained-health validation (Rule V2).
+- **main.py**: resumable Postgres-driven poll loop featuring multi-tier retry handling, stale incident timeout cleanup, and database reconnect resilience.
 
 Safety boundary: the orchestrator's ServiceAccount (`orchestrator-sa`) is RBAC-scoped to the `online-boutique` namespace only, with exactly the verbs each Fixer action needs — no cluster-wide grants, no `exec`.
 
@@ -181,11 +188,13 @@ podman run -d --name pg-test -e POSTGRES_PASSWORD=test -p 5433:5432 postgres:16
 cd orchestrator
 python3 -m venv .venv && .venv/bin/pip install -e .
 export TEST_DATABASE_URL="postgresql://postgres:test@localhost:5433/postgres"
-.venv/bin/python -m pytest -v        # 72 tests, no cluster needed
+.venv/bin/python -m pytest -v        # 88 tests (including DB and 5-scenario e2e tests), no cluster needed
 
 # Harness tests (pure functions only, no DB/cluster needed)
 cd ../harness
 python3 -m pytest -v                 # 12 tests
+# Total: 100 tests passed out of 100
+
 ```
 
 ## Project structure

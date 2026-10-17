@@ -87,40 +87,22 @@ logger = logging.getLogger(__name__)
 # than a configurable value threaded through the pipeline.
 NAMESPACE = "online-boutique"
 
-# The three scenario/target pairs the plan defines; used by the production
+# The five scenario/target pairs the system supports; used by the production
 # `main()` loop. `run_once` itself takes `scenarios` as an explicit
 # parameter so tests can pass their own list.
 SCENARIOS: list[tuple[str, str]] = [
     ("pod_crash", "cartservice"),
     ("cpu_stress", "recommendationservice"),
     ("memory_pressure", "productcatalogservice"),
+    ("network_latency", "shippingservice"),
+    ("service_unavailability", "paymentservice"),
 ]
 
 # `build_evidence`'s lookback window used by the verification lambda in
 # `_advance_incident`. This is intentionally NOT the same 300s window
 # `observer.poll_once` always passes for original detection (see
 # observer.py's `poll_once`, which hardcodes window_seconds=300
-# independently of this constant). Verification runs only ~one poll
-# interval plus VERIFY_BACKOFF_SECONDS after the fix was applied (tens of
-# seconds), but a 300s window here would still contain the pre-fix breach
-# for the signals that use `window_seconds` directly (cpu_ratio, mem_ratio,
-# error_rate, p99_latency_ms). restart_count_delta and oom_killed are
-# exceptions to that: restart_count_delta always queries over its own
-# short, independent RESTART_WINDOW_SECONDS (60s, see observer.py)
-# regardless of what window_seconds is passed here, and oom_killed (a
-# kube-state-metrics gauge via `kube_pod_container_status_last_terminated_
-# reason`, which otherwise has no time scoping at all - see observer.py)
-# is gated on that same RESTART_WINDOW_SECONDS restart check, precisely so
-# a stale, long-resolved OOM event from before the fix can't keep
-# verification stuck at recovered=False forever. For the remaining
-# window_seconds-driven signals, though, a verification row permanently
-# resolves (or fails to resolve) the incident - there's no retry - so a
-# stale window would read the old breach and wrongly report
-# `recovered=False` forever, silently corrupting every chaos run's
-# measured recovery outcome (Task 17's harness depends on this being
-# accurate). This window is sized to roughly "time since the fix was
-# applied" instead: long enough for a stable reading, short enough to
-# exclude the pre-fix breach.
+# independently of this constant).
 VERIFY_WINDOW_SECONDS = 60
 
 # Default verifier backoff per the plan's Global Constraints ("Verifier
@@ -135,6 +117,22 @@ def _verify_backoff_seconds() -> int:
     return int(os.environ.get("VERIFY_BACKOFF_SECONDS", str(DEFAULT_VERIFY_BACKOFF_SECONDS)))
 
 
+def _verify_sample_count() -> int:
+    return int(os.environ.get("VERIFY_SAMPLE_COUNT", "1"))
+
+
+def _verify_sample_interval_seconds() -> float:
+    return float(os.environ.get("VERIFY_SAMPLE_INTERVAL_SECONDS", "5.0"))
+
+
+def _max_retries() -> int:
+    return int(os.environ.get("MAX_RETRIES", "1"))
+
+
+def _incident_timeout_seconds() -> int:
+    return int(os.environ.get("INCIDENT_TIMEOUT_SECONDS", "600"))
+
+
 def _evidence_from_anomaly_payload(target: str, payload: dict[str, Any]) -> EvidenceSummary:
     """Rebuild the EvidenceSummary the Observer captured at anomaly_detected time.
 
@@ -143,13 +141,14 @@ def _evidence_from_anomaly_payload(target: str, payload: dict[str, Any]) -> Evid
     """
     return EvidenceSummary(
         target=target,
-        restart_count_delta=payload["restart_count_delta"],
-        error_rate=payload["error_rate"],
-        cpu_ratio=payload["cpu_ratio"],
-        p99_latency_ms=payload["p99_latency_ms"],
-        p99_latency_rising=payload["p99_latency_rising"],
-        oom_killed=payload["oom_killed"],
-        mem_ratio=payload["mem_ratio"],
+        restart_count_delta=payload.get("restart_count_delta", 0),
+        error_rate=payload.get("error_rate", 0.0),
+        cpu_ratio=payload.get("cpu_ratio", 0.0),
+        p99_latency_ms=payload.get("p99_latency_ms", 0.0),
+        p99_latency_rising=payload.get("p99_latency_rising", False),
+        oom_killed=payload.get("oom_killed", False),
+        mem_ratio=payload.get("mem_ratio", 0.0),
+        available_replicas=payload.get("available_replicas", 1),
     )
 
 
@@ -290,13 +289,47 @@ def _advance_incident(
             ),
             observer.check_threshold,
             backoff_seconds=_verify_backoff_seconds(),
+            sample_count=_verify_sample_count(),
+            sample_interval_seconds=_verify_sample_interval_seconds(),
         )
         latency_ms = int((time.monotonic() - start) * 1000)
+
+        # Multi-tier retry logic: if verification failed and retries remain, attempt escalation/retry
+        all_events = db.get_events(conn, incident_id)
+        fix_events = [e for e in all_events if e.stage == "fix_executed"]
+        max_retries = _max_retries()
+        if not result.recovered and len(fix_events) < max_retries:
+            # If scaling did not relieve CPU stress on pinned pod, escalate to restart_pod
+            retry_action = (
+                "restart_pod"
+                if (scenario == "cpu_stress" and decision.action == "scale_replicas")
+                else decision.action
+            )
+            fix_result = fixer.execute(retry_action, core_v1, apps_v1, NAMESPACE, target)
+            db.append_event(
+                conn,
+                incident_id,
+                "fix_executed",
+                {
+                    "action": fix_result.action,
+                    "target": fix_result.target,
+                    "success": fix_result.success,
+                    "detail": f"retry attempt {len(fix_events) + 1}: {fix_result.detail}",
+                    "retry_attempt": len(fix_events) + 1,
+                },
+                latency_ms=latency_ms,
+            )
+            return
+
         db.append_event(
             conn,
             incident_id,
             "verification",
-            {"recovered": result.recovered, "checked_at": result.checked_at.isoformat()},
+            {
+                "recovered": result.recovered,
+                "checked_at": result.checked_at.isoformat(),
+                "attempts": len(fix_events),
+            },
             latency_ms=latency_ms,
         )
 
@@ -321,6 +354,7 @@ def run_once(
     incident would abort the whole poll cycle and every *other* incident
     due for advancement in this cycle would silently miss its turn.
     """
+    db.close_stale_incidents(conn, _incident_timeout_seconds())
     observer.poll_once(prom_client, loki_client, conn, scenarios)
     for incident_id in db.get_incomplete_incidents(conn):
         try:

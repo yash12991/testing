@@ -149,6 +149,8 @@ SCENARIOS: list[tuple[str, str, Path]] = [
     ("pod_crash", "cartservice", CHAOS_DIR / "pod-crash.yaml"),
     ("cpu_stress", "recommendationservice", CHAOS_DIR / "cpu-stress.yaml"),
     ("memory_pressure", "productcatalogservice", CHAOS_DIR / "memory-pressure.yaml"),
+    ("network_latency", "shippingservice", CHAOS_DIR / "network-latency.yaml"),
+    ("service_unavailability", "paymentservice", CHAOS_DIR / "service-unavailability.yaml"),
 ]
 
 # cpu_stress's cpu_ratio uses a 300s rate() window and, per task-16-report.md's

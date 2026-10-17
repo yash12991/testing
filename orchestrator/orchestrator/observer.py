@@ -160,6 +160,16 @@ def build_evidence(
     )
     oom_killed = oom_killed_flag and restart_count_delta > 0
 
+    available_replicas = 1
+    if scenario == "service_unavailability":
+        try:
+            available_val = prom_client.query(
+                f'max(kube_deployment_status_replicas_available{{deployment="{target}"}})'
+            )
+            available_replicas = int(available_val)
+        except Exception:
+            available_replicas = 1
+
     return EvidenceSummary(
         target=target,
         restart_count_delta=restart_count_delta,
@@ -174,20 +184,15 @@ def build_evidence(
         p99_latency_rising=False,
         oom_killed=oom_killed,
         mem_ratio=mem_ratio,
+        available_replicas=available_replicas,
     )
 
 
 def check_threshold(scenario: str, evidence: EvidenceSummary) -> bool:
     """Return True if `evidence` breaches the threshold for `scenario`.
 
-    pod_crash and cpu_stress were simplified from their original two-leg
-    thresholds (restart_count_delta > 0 OR error_rate > 0.1; cpu_ratio >
-    0.85 AND p99_latency_rising) down to their single reliable leg each,
-    because no Online Boutique service exports http_requests_total or any
-    latency histogram - error_rate and p99_latency_rising are therefore
-    always 0.0/False in practice and can never contribute a real signal.
-    The EvidenceSummary fields themselves are kept for forward
-    compatibility; only the trigger logic here stopped consuming them.
+    Supports all 5 scenarios: pod_crash, cpu_stress, memory_pressure,
+    network_latency, and service_unavailability.
     """
     if scenario == "pod_crash":
         return evidence.restart_count_delta > 0
@@ -195,6 +200,10 @@ def check_threshold(scenario: str, evidence: EvidenceSummary) -> bool:
         return evidence.cpu_ratio > 0.85
     if scenario == "memory_pressure":
         return evidence.oom_killed or evidence.mem_ratio > 0.9
+    if scenario == "network_latency":
+        return evidence.p99_latency_ms > 150.0
+    if scenario == "service_unavailability":
+        return evidence.available_replicas == 0 or evidence.error_rate > 0.5
     raise ValueError(f"unknown scenario: {scenario!r}")
 
 
@@ -231,5 +240,6 @@ def poll_once(
                 "p99_latency_rising": evidence.p99_latency_rising,
                 "oom_killed": evidence.oom_killed,
                 "mem_ratio": evidence.mem_ratio,
+                "available_replicas": evidence.available_replicas,
             },
         )

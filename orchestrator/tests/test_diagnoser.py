@@ -103,3 +103,41 @@ def test_diagnose_unrecognized_evidence_yields_unknown():
     assert d.confidence == 0.0
     assert d.action is None
     assert d.evidence_cited == []
+
+
+def test_diagnose_service_unavailability_yields_service_down():
+    evidence = EvidenceSummary(
+        restart_count_delta=0,
+        error_rate=0.0,
+        cpu_ratio=0.1,
+        p99_latency_ms=50,
+        p99_latency_rising=False,
+        oom_killed=False,
+        mem_ratio=0.1,
+        available_replicas=0,
+        target="paymentservice",
+    )
+    d = diagnoser.diagnose(evidence)
+    assert d.cause == "service_down_or_unreachable"
+    assert d.confidence == 0.90
+    assert d.action == "rollback_deployment"
+    assert "available_replicas" in d.evidence_cited
+
+
+def test_diagnose_network_latency_yields_degraded_dependency():
+    evidence = EvidenceSummary(
+        restart_count_delta=0,
+        error_rate=0.0,
+        cpu_ratio=0.1,
+        p99_latency_ms=250.0,
+        p99_latency_rising=False,
+        oom_killed=False,
+        mem_ratio=0.1,
+        target="shippingservice",
+    )
+    d = diagnoser.diagnose(evidence)
+    assert d.cause == "degraded_dependency_or_network_congestion"
+    assert d.confidence == 0.85
+    assert d.action == "restart_pod"
+    assert "p99_latency_ms" in d.evidence_cited
+

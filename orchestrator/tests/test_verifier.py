@@ -91,3 +91,38 @@ def test_verify_sets_checked_at_timestamp():
         backoff_seconds=0,
     )
     assert result.checked_at is not None
+
+
+def test_verify_sustained_health_all_samples_pass():
+    calls = []
+    result = verifier.verify(
+        "cpu_stress",
+        lambda: HEALTHY_EVIDENCE,
+        lambda scenario, ev: False,
+        sleep_fn=calls.append,
+        backoff_seconds=10,
+        sample_count=3,
+        sample_interval_seconds=5,
+    )
+    assert result.recovered is True
+    # Initial backoff of 10s, then 2 intervals of 5s
+    assert calls == [10, 5, 5]
+
+
+def test_verify_sustained_health_fails_if_any_sample_breaches():
+    readings = [False, True, False]  # Sample 2 breaches
+
+    def check_fn(scenario, ev):
+        return readings.pop(0)
+
+    result = verifier.verify(
+        "cpu_stress",
+        lambda: HEALTHY_EVIDENCE,
+        check_fn,
+        sleep_fn=lambda s: None,
+        backoff_seconds=0,
+        sample_count=3,
+        sample_interval_seconds=1,
+    )
+    assert result.recovered is False
+

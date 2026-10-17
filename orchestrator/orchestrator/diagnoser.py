@@ -42,15 +42,16 @@ from orchestrator.models import Diagnosis, EvidenceSummary
 TRANSIENT_POD_FAILURE_CONFIDENCE = 0.95
 RESOURCE_EXHAUSTION_CONFIDENCE = 0.9
 UNDERSIZED_LIMIT_OR_LEAK_CONFIDENCE = 0.85
+SERVICE_DOWN_CONFIDENCE = 0.90
+NETWORK_DEGRADED_CONFIDENCE = 0.85
 UNKNOWN_CONFIDENCE = 0.0
 
 
 def diagnose(evidence: EvidenceSummary) -> Diagnosis:
     """Map `evidence` to a `Diagnosis` using the fixed decision table.
 
-    Rule order is memory_pressure, then pod_crash, then cpu_stress — see
-    this module's docstring for why memory_pressure must be checked before
-    pod_crash.
+    Rule order is memory_pressure, then pod_crash, then cpu_stress, then
+    service_unavailability, then network_latency.
     """
     # Rule 1: memory pressure. Checked BEFORE pod crash: see module docstring.
     memory_fields = []
@@ -82,6 +83,24 @@ def diagnose(evidence: EvidenceSummary) -> Diagnosis:
             confidence=RESOURCE_EXHAUSTION_CONFIDENCE,
             evidence_cited=["cpu_ratio"],
             action="scale_replicas",
+        )
+
+    # Rule 4: Service unavailability (ready replicas == 0).
+    if evidence.available_replicas == 0:
+        return Diagnosis(
+            cause="service_down_or_unreachable",
+            confidence=SERVICE_DOWN_CONFIDENCE,
+            evidence_cited=["available_replicas"],
+            action="rollback_deployment",
+        )
+
+    # Rule 5: Network latency degradation.
+    if evidence.p99_latency_ms > 150.0:
+        return Diagnosis(
+            cause="degraded_dependency_or_network_congestion",
+            confidence=NETWORK_DEGRADED_CONFIDENCE,
+            evidence_cited=["p99_latency_ms"],
+            action="restart_pod",
         )
 
     # No rule matched.
