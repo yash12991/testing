@@ -7,8 +7,17 @@ rules in a fixed order and returns the first match:
    Fires on `oom_killed` or `mem_ratio > 0.9`.
 2. Pod crash      -> `transient_pod_failure`  (confidence 0.95, restart_pod)
    Fires on `restart_count_delta > 0`.
-3. CPU stress     -> `resource_exhaustion`    (confidence 0.9,  scale_replicas)
-   Fires on `cpu_ratio > 0.85`.
+3. CPU stress     -> `resource_exhaustion`    (confidence 0.9,  action depends on `cpu_hotspot`)
+   Fires on `cpu_ratio > 0.85`. Action is `restart_pod` when `cpu_hotspot`
+   is True (one specific pod is saturated — restarting it ends the load,
+   live-verified 2026-10-20 against a real Chaos Mesh StressChaos
+   injection: deleting the hotspot pod ended the stress immediately and
+   Chaos Mesh did not re-select a replacement), else `scale_replicas`
+   (load is spread across matching pods — adding more actually helps).
+   This replaces the original, since-proven-wrong behaviour of always
+   scaling: `scale_replicas` alone never relieves a true hotspot, because
+   it adds idle siblings next to the still-saturated pod without ever
+   touching it (see results/EVALUATION.md's "0 of N" finding).
 
 Memory pressure is checked FIRST, ahead of pod crash, even though it has the
 lower fixed confidence. This is a deliberate fix (final-review Fix 2): since
@@ -75,13 +84,16 @@ def diagnose(evidence: EvidenceSummary) -> Diagnosis:
             action="restart_pod",
         )
 
-    # Rule 3: CPU stress.
+    # Rule 3: CPU stress. Action depends on cpu_hotspot: restart the one
+    # saturated pod (verified to actually end the load) rather than scale
+    # out (verified NOT to, since it never touches the saturated pod).
     if evidence.cpu_ratio > 0.85:
+        evidence_cited = ["cpu_ratio", "cpu_hotspot"] if evidence.cpu_hotspot else ["cpu_ratio"]
         return Diagnosis(
             cause="resource_exhaustion",
             confidence=RESOURCE_EXHAUSTION_CONFIDENCE,
-            evidence_cited=["cpu_ratio"],
-            action="scale_replicas",
+            evidence_cited=evidence_cited,
+            action="restart_pod" if evidence.cpu_hotspot else "scale_replicas",
         )
 
     # No rule matched.

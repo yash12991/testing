@@ -94,6 +94,41 @@ def test_diagnose_plain_container_kill_still_yields_transient_pod_failure():
     assert d.action == "restart_pod"
 
 
+def test_diagnose_cpu_hotspot_yields_restart_pod_not_scale_replicas():
+    # Live-verified 2026-10-20: deleting a single CPU-hotspot pod under a
+    # real Chaos Mesh StressChaos injection ended the stress immediately
+    # (the injected load lives inside that one container and Chaos Mesh
+    # does not re-select a replacement pod), while scale_replicas alone
+    # never touches the saturated pod at all (results/EVALUATION.md's
+    # measured 0-of-N remediation success). cpu_hotspot=True must now route
+    # to restart_pod instead of the old always-scale behaviour.
+    evidence = EvidenceSummary(restart_count_delta=0, error_rate=0.0, cpu_ratio=0.9,
+                                p99_latency_ms=50, p99_latency_rising=False,
+                                oom_killed=False, mem_ratio=0.1, target="recommendationservice",
+                                cpu_hotspot=True)
+    d = diagnoser.diagnose(evidence)
+    assert d.cause == "resource_exhaustion"
+    assert d.confidence == 0.9
+    assert d.action == "restart_pod"
+    assert "cpu_hotspot" in d.evidence_cited
+
+
+def test_diagnose_cpu_load_spread_yields_scale_replicas_not_restart_pod():
+    # The converse case: cpu_hotspot=False means load is spread across
+    # matching pods (not one pod saturated while siblings are fine) -
+    # restarting the one pod handling its fair share would not relieve
+    # genuine fleet-wide saturation, so scale_replicas remains correct here.
+    evidence = EvidenceSummary(restart_count_delta=0, error_rate=0.0, cpu_ratio=0.9,
+                                p99_latency_ms=50, p99_latency_rising=False,
+                                oom_killed=False, mem_ratio=0.1, target="recommendationservice",
+                                cpu_hotspot=False)
+    d = diagnoser.diagnose(evidence)
+    assert d.cause == "resource_exhaustion"
+    assert d.confidence == 0.9
+    assert d.action == "scale_replicas"
+    assert d.evidence_cited == ["cpu_ratio"]
+
+
 def test_diagnose_unrecognized_evidence_yields_unknown():
     evidence = EvidenceSummary(restart_count_delta=0, error_rate=0.0, cpu_ratio=0.1,
                                 p99_latency_ms=50, p99_latency_rising=False,

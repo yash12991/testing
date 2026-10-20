@@ -29,9 +29,10 @@ class FakePromClient:
     """Routes on the same real PromQL substrings as test_observer.py's fake.
 
     With `breach_then_healthy_sequence=True`: the first `build_evidence`
-    call (6 `.query()` calls, in the fixed order `build_evidence` issues
-    them: restart, error_rate, cpu_ratio, p99_latency, mem_ratio, then the
-    kube-state-metrics OOM check) reports a pod_crash breach
+    call (8 `.query()` calls, in the fixed order `build_evidence` issues
+    them: restart, error_rate, cpu_ratio (max), cpu_ratio_avg, cpu_pod_count,
+    p99_latency, mem_ratio, then the kube-state-metrics OOM check) reports a
+    pod_crash breach
     (restart_count_delta > 0); every `build_evidence` call after that
     reports a fully healthy pod. `main.run_once`'s diagnosis step reads
     from the stored anomaly_detected payload rather than re-querying, so
@@ -47,7 +48,7 @@ class FakePromClient:
     `poll_once` resumes polling that pair for a fresh anomaly.
     """
 
-    QUERIES_PER_BUILD = 6
+    QUERIES_PER_BUILD = 8
 
     def __init__(self, breach_then_healthy_sequence: bool = False):
         self.breach_then_healthy_sequence = breach_then_healthy_sequence
@@ -64,6 +65,8 @@ class FakePromClient:
             return 3.0 if breaching else 0.0
         if 'status=~"5.."' in promql:
             return 0.0
+        if "count(kube_pod_container_resource_limits" in promql:
+            return 2.0  # pod count: not <=1, so cpu_hotspot stays False here (pod_crash isn't cpu_stress)
         if "cpu" in promql:
             return 0.1
         if "bucket" in promql:

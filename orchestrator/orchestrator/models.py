@@ -30,6 +30,17 @@ class EvidenceSummary:
     p99_latency_rising: bool = False
     oom_killed: bool = False
     mem_ratio: float = 0.0
+    # True when the worst matching pod's CPU usage is far above the average
+    # across all matching pods (or there's only one pod at all) - i.e. one
+    # specific pod is saturated while its siblings, if any, are not. False
+    # means the load is roughly spread across all matching pods instead.
+    # Live-verified (2026-10-20): deleting the single hotspot pod under a
+    # real Chaos Mesh StressChaos injection ended the stress immediately -
+    # the stress process lives inside that specific container and Chaos
+    # Mesh does not re-select a replacement pod - so `restart_pod` is the
+    # correct fix for a hotspot, not `scale_replicas` (which only adds idle
+    # siblings next to the still-saturated pod and never touches it).
+    cpu_hotspot: bool = False
 
 
 @dataclass

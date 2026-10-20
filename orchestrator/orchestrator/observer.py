@@ -114,6 +114,32 @@ def build_evidence(
         f' / max(kube_pod_container_resource_limits'
         f'{{pod=~"{target}.*",container="{TARGET_CONTAINER}",resource="cpu"}})'
     )
+    # cpu_hotspot distinguishes "one pod saturated, siblings fine" (restart
+    # fixes it - live-verified 2026-10-20) from "load spread across all
+    # matching pods" (restart would not help; scale_replicas would). Needs
+    # the AVERAGE ratio alongside the worst-pod cpu_ratio above, plus how
+    # many pods are even in play: with only one matching pod, max and avg
+    # are the same number and can't be compared, so "is it a hotspot" has
+    # no other pod to be a hotspot relative to - treated as a hotspot by
+    # definition (restart is also the only lever that can possibly help a
+    # lone saturated pod; scaling it out just adds idle siblings next to
+    # it). With 2+ pods, a hotspot is when the worst pod runs hot while the
+    # average across all of them does not (ratio > 2, i.e. the worst pod is
+    # using more than double the typical share) - mirrors a real load
+    # spread evenly across replicas, where max and avg stay close together.
+    cpu_ratio_avg = prom_client.query(
+        f'avg(rate(container_cpu_usage_seconds_total'
+        f'{{pod=~"{target}.*",container="{TARGET_CONTAINER}"}}[{window_seconds}s]))'
+        f' / avg(kube_pod_container_resource_limits'
+        f'{{pod=~"{target}.*",container="{TARGET_CONTAINER}",resource="cpu"}})'
+    )
+    cpu_pod_count = int(
+        prom_client.query(
+            f'count(kube_pod_container_resource_limits'
+            f'{{pod=~"{target}.*",container="{TARGET_CONTAINER}",resource="cpu"}})'
+        )
+    )
+    cpu_hotspot = cpu_pod_count <= 1 or (cpu_ratio_avg > 0 and (cpu_ratio / cpu_ratio_avg) > 2)
     p99_latency_ms = prom_client.query(
         f'histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket'
         f'{{service="{target}"}}[{window_seconds}s])) by (le)) * 1000'
@@ -174,6 +200,7 @@ def build_evidence(
         p99_latency_rising=False,
         oom_killed=oom_killed,
         mem_ratio=mem_ratio,
+        cpu_hotspot=cpu_hotspot,
     )
 
 
@@ -231,5 +258,6 @@ def poll_once(
                 "p99_latency_rising": evidence.p99_latency_rising,
                 "oom_killed": evidence.oom_killed,
                 "mem_ratio": evidence.mem_ratio,
+                "cpu_hotspot": evidence.cpu_hotspot,
             },
         )

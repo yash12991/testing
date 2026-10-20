@@ -220,7 +220,7 @@ results/                             Full build log + evaluation summary (this r
 
 ## Known limitations (stated honestly — see `results/BUILD_LOG.md` and `results/EVALUATION.md` for the full story)
 
-- **`cpu_stress`'s only remediation (`scale_replicas`) does not actually relieve a single stressed pod.** This was discovered and is measured honestly in the evaluation data — see `results/EVALUATION.md`. It's a real finding about the limits of the current action set, not a bug in the measurement.
+- **(Fixed 2026-10-20) `cpu_stress` used to only know `scale_replicas`, which never relieves a single stressed pod** — discovered and measured honestly in the evaluation data (see `results/EVALUATION.md`). The Diagnoser now distinguishes a CPU **hotspot** (one pod saturated → `restart_pod`, live-verified to actually end the injected load) from genuine **load saturation** (spread across replicas → `scale_replicas` still applies).
 - **`pod_crash`'s measured recovery may partly reflect Kubernetes' own self-healing** (the `container-kill` chaos action causes an in-place kubelet restart within seconds, independent of the Fixer's own `restart_pod` action).
 - Online Boutique exports no HTTP-level (request/error/latency) metrics without a service-mesh sidecar, so detection relies on resource and object-level signals only (CPU/memory ratios, restart counts, OOM reason) — `error_rate` and `p99_latency_ms` fields exist in the data model for forward-compatibility but aren't currently populated.
 - The orchestrator's image lives only in this node's local container store (no registry) — rebuilding the cluster from scratch requires re-running `deploy_orchestrator.sh`.

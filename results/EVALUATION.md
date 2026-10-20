@@ -16,7 +16,15 @@ Zero escalations, zero timeouts across all 15 trials.
 
 ## Three things in this table that need honest context, not just the number
 
-### 1. `cpu_stress`'s remediation_success/MTTR in this file predate a correctness fix — the real answer is 0/3, not 3/3
+### Update (2026-10-20): the 0/3 gap below is now fixed, live-verified
+
+After this page was first written, a "Rule Book" document (produced by the team) proposed exactly the right fix: distinguish a CPU **hotspot** (one specific pod saturated, the rest fine — restart it) from genuine **load saturation** (all replicas equally loaded — scaling actually helps). `cpu_stress`'s only remediation had always been `scale_replicas`, which is the *load-saturation* answer, applied unconditionally even though Chaos Mesh's `mode: one` injection is always a single-pod hotspot by construction — exactly why it measured 0/3 below.
+
+Before changing any code, we verified live that restarting the specific stressed pod actually ends the injected CPU load (it doesn't just move elsewhere): deleted the hotspot pod while `cpu_ratio=0.87`, watched the replacement pod hold steady at `~0.10-0.12` for 30 seconds, and confirmed Chaos Mesh's `StressChaos` experiment stayed locked onto the now-deleted pod rather than re-selecting the new one. Only after that did we add a `cpu_hotspot` signal (worst-pod ratio vs. fleet-average ratio, or a single replica) and have the Diagnoser pick `restart_pod` for a hotspot instead of always `scale_replicas`.
+
+**Real result from the live cluster, same day:** a genuine CPU-stress trial now produces `cpu_hotspot: true` → `action: restart_pod` → the stressed pod is deleted → **`recovered: true`**. This is the first time `cpu_stress` has resolved for a real reason rather than a measurement artifact. The 3/5 detection rate and the 0/3 remediation number below are the honest historical record of what shipped for the second review; they are superseded in behavior (not in the raw data, which is kept as-is) by this fix. A fresh batch run with `--runs-per-scenario 10` would give a current, single-source-of-truth table.
+
+### 1. `cpu_stress`'s remediation_success/MTTR in this file predate a correctness fix — the real answer is 0/3, not 3/3 (now fixed, see "Update" above)
 
 The committed file above shows `remediation_success: 3/3`. That number was measured with a bug: the `cpu_ratio` metric averaged across all matching pods, so once the fix (`scale_replicas`) added two idle replicas, the *cluster-wide average* dropped below threshold even though the single pod Chaos Mesh was actually stressing stayed fully saturated the whole time. The system was declaring victory because the average got diluted, not because anything recovered.
 

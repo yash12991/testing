@@ -25,6 +25,8 @@ class FakePromClient:
         restart_count_delta: float = 0.0,
         error_rate: float = 0.0,
         cpu_ratio: float = 0.0,
+        cpu_ratio_avg: float | None = None,
+        cpu_pod_count: float = 2,
         p99_latency_ms: float = 0.0,
         mem_ratio: float = 0.0,
         oom_killed: bool = False,
@@ -32,6 +34,13 @@ class FakePromClient:
         self.restart_count_delta = restart_count_delta
         self.error_rate = error_rate
         self.cpu_ratio = cpu_ratio
+        # Defaults to cpu_ratio itself (worst pod == average pod, i.e. load
+        # spread evenly, not a hotspot) and cpu_pod_count defaults to 2 (not
+        # <=1), so every existing test that only sets `cpu_ratio` keeps
+        # getting `cpu_hotspot=False` / `scale_replicas` exactly as before -
+        # new hotspot-specific tests pass these two explicitly instead.
+        self.cpu_ratio_avg = cpu_ratio_avg if cpu_ratio_avg is not None else cpu_ratio
+        self.cpu_pod_count = cpu_pod_count
         self.p99_latency_ms = p99_latency_ms
         self.mem_ratio = mem_ratio
         self.oom_killed = oom_killed
@@ -52,12 +61,21 @@ class FakePromClient:
         # neither "restart" nor "mem", but routing order is checked
         # defensively anyway since all the substring checks are on the
         # same string.
+        #
+        # The three CPU queries (max-ratio, avg-ratio, pod count) all
+        # contain the plain substring "cpu" (via container_cpu_usage_... or
+        # resource="cpu"), so they must be routed on more specific
+        # substrings, checked before the generic "cpu" fallback.
         if "OOMKilled" in promql:
             return 1.0 if self.oom_killed else 0.0
         if "restart" in promql:
             return self.restart_count_delta
         if 'status=~"5.."' in promql:
             return self.error_rate
+        if "count(kube_pod_container_resource_limits" in promql:
+            return self.cpu_pod_count
+        if "avg(rate(container_cpu" in promql:
+            return self.cpu_ratio_avg
         if "cpu" in promql:
             return self.cpu_ratio
         if "bucket" in promql:
@@ -249,7 +267,41 @@ def test_build_evidence_assembles_summary_from_clients():
     assert evidence.p99_latency_rising is False
     assert evidence.mem_ratio == 0.3
     assert evidence.oom_killed is False
+    assert evidence.cpu_hotspot is False  # default fake: pod_count=2, ratio==avg
     assert fake_prom.queries  # the client was actually queried
+
+
+def test_build_evidence_cpu_hotspot_true_with_single_pod():
+    # With only one matching pod, max and avg are the same number and
+    # there's no other pod to compare against - treated as a hotspot by
+    # definition, since restart is also the only lever that could possibly
+    # help a lone saturated pod.
+    fake_prom = FakePromClient(cpu_ratio=0.9, cpu_ratio_avg=0.9, cpu_pod_count=1)
+    evidence = observer.build_evidence(
+        fake_prom, FakeLokiClient(), "cpu_stress", "recommendationservice", 300
+    )
+    assert evidence.cpu_hotspot is True
+
+
+def test_build_evidence_cpu_hotspot_true_when_worst_pod_far_above_average():
+    # 3 matching pods, one pegged at 0.9 while the fleet average is only
+    # 0.3 (ratio 3x) - one pod is saturated while its siblings are not.
+    fake_prom = FakePromClient(cpu_ratio=0.9, cpu_ratio_avg=0.3, cpu_pod_count=3)
+    evidence = observer.build_evidence(
+        fake_prom, FakeLokiClient(), "cpu_stress", "recommendationservice", 300
+    )
+    assert evidence.cpu_hotspot is True
+
+
+def test_build_evidence_cpu_hotspot_false_when_load_spread_evenly():
+    # 3 matching pods, worst pod only slightly above the fleet average
+    # (ratio ~1.2x, well under the >2x hotspot threshold) - load is spread
+    # across all of them, not concentrated on one.
+    fake_prom = FakePromClient(cpu_ratio=0.9, cpu_ratio_avg=0.75, cpu_pod_count=3)
+    evidence = observer.build_evidence(
+        fake_prom, FakeLokiClient(), "cpu_stress", "recommendationservice", 300
+    )
+    assert evidence.cpu_hotspot is False
 
 
 def test_build_evidence_detects_oom_killed_from_prometheus():

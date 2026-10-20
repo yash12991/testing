@@ -150,6 +150,12 @@ def _evidence_from_anomaly_payload(target: str, payload: dict[str, Any]) -> Evid
         p99_latency_rising=payload["p99_latency_rising"],
         oom_killed=payload["oom_killed"],
         mem_ratio=payload["mem_ratio"],
+        # .get(..., False), not payload["cpu_hotspot"]: incidents whose
+        # anomaly_detected row was written before this field existed have
+        # no such key. Defaulting to False reproduces the pre-R8-fix
+        # behaviour (scale_replicas) for any such incident rather than
+        # raising KeyError and leaving it stuck forever.
+        cpu_hotspot=payload.get("cpu_hotspot", False),
     )
 
 
